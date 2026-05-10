@@ -14,15 +14,14 @@
 //!   obfs=tls  — 0x16 (TLS ClientHello)
 
 use anyhow::{bail, Result};
-use rand::RngCore;
 use snell::cipher::{SnellCipher, SALT_LEN};
-use snell::quic::{gc_sessions, new_session_table, SessionTable, SessionToken, UdpSession};
+use snell::quic::{gc_sessions, new_session_table, SessionTable, UdpSession};
 use snell::relay::copy_t2c_adaptive;
 use snell::snell::{
-    parse_request, read_chunk, CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR,
+    parse_request, read_chunk, CMD_CONNECT, CMD_CONNECT_V2, CMD_PING, RESP_ERROR,
     RESP_PONG, RESP_TUNNEL,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicU64;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,7 +33,6 @@ use std::os::unix::io::RawFd;
 
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 const MAX_CONCURRENT_CONNS: usize = 4096;
-const MAX_UDP_SESSIONS: usize = 10_000;
 
 fn main() -> Result<()> {
     // Read systemd FDs before any threads exist.
@@ -95,7 +93,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
             if quic_enabled {
                 if let Some(&udp_fd) = activation_fds_i32.get(1) {
                     let udp_sock = snell::activation::into_udp_socket(udp_fd)?;
-                    spawn_udp_listener(udp_sock, session_table.clone());
+                    spawn_udp_listener(udp_sock, session_table.clone(), psk.clone(), egress_iface.clone());
                 }
             }
             tcp_ln
@@ -108,7 +106,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         let ln = TcpListener::bind(listen).await?;
         if quic_enabled {
             let udp_sock = snell::egress::bind_udp(listen, None)?;
-            spawn_udp_listener(udp_sock, session_table.clone());
+            spawn_udp_listener(udp_sock, session_table.clone(), psk.clone(), egress_iface.clone());
         }
         ln
     };
@@ -147,23 +145,16 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         let psk = psk.clone();
         let tls_acceptor = tls_acceptor.clone();
         let iface = egress_iface.clone();
-        let sessions = session_table.clone();
         tokio::spawn(async move {
             let _permit = permit; // released on drop
-            let result = tokio::time::timeout(
-                Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-                dispatch(
-                    conn,
-                    &psk,
-                    &tls_acceptor,
-                    iface.as_deref().map(String::as_str),
-                    &sessions,
-                ),
+            if let Err(e) = dispatch(
+                conn,
+                &psk,
+                &tls_acceptor,
+                iface.as_deref().map(String::as_str),
             )
-            .await;
-            if result.is_err() {
-                eprintln!("[{peer}] handshake timeout");
-            } else if let Ok(Err(e)) = result {
+            .await
+            {
                 eprintln!("[{peer}] {e}");
             }
         });
@@ -182,103 +173,115 @@ fn make_tls_acceptor() -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-fn spawn_udp_listener(sock: tokio::net::UdpSocket, table: SessionTable) {
+fn spawn_udp_listener(
+    sock: tokio::net::UdpSocket,
+    table: SessionTable,
+    psk: Arc<Vec<u8>>,
+    iface: Option<Arc<String>>,
+) {
     let sock = Arc::new(sock);
     tokio::spawn(async move {
-        if let Err(e) = run_udp_relay(sock, table).await {
+        if let Err(e) = run_udp_relay(sock, table, psk, iface).await {
             eprintln!("[QUIC UDP] {e}");
         }
     });
 }
 
-/// UDP relay loop: route datagrams via session token.
-async fn run_udp_relay(sock: Arc<tokio::net::UdpSocket>, table: SessionTable) -> Result<()> {
+/// UDP relay loop: classify datagrams by byte[0] and route by source sockaddr.
+async fn run_udp_relay(
+    sock:  Arc<tokio::net::UdpSocket>,
+    table: SessionTable,
+    psk:   Arc<Vec<u8>>,
+    iface: Option<Arc<String>>,
+) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (n, src) = match sock.recv_from(&mut buf).await {
             Ok(x) => x,
             Err(_) => continue,
         };
-        if n < 8 {
-            continue;
-        }
+        if n == 0 { continue; }
 
-        let token_bytes: [u8; 8] = match buf[..8].try_into() {
-            Ok(b) => b,
-            Err(_) => continue,
+        let kind = match snell::quic::classify(&buf[..n]) {
+            Some(k) => k,
+            None    => continue,
         };
-        let token = snell::quic::SessionToken(token_bytes);
-        let payload = buf[8..n].to_vec();
 
-        let session = {
-            let guard = table.lock().await;
-            match guard.get(&token) {
-                Some(s) => s.clone(),
-                None => continue,
+        // Existing session?
+        let session = { table.lock().await.get(&src).cloned() };
+
+        match (kind, session) {
+            (snell::quic::PacketKind::Data, None) => {
+                eprintln!("[QUIC] data packet without session from {src}");
             }
-        };
-
-        session.touch();
-
-        // First-datagram bootstrap: discover client_addr, spawn target→client task once.
-        {
-            let mut addr_lock = session.client_addr.lock().await;
-            if addr_lock.is_none() {
-                *addr_lock = Some(src);
-                if !session.recv_started.swap(true, Ordering::SeqCst) {
-                    let session_clone = session.clone();
-                    let sock_clone = sock.clone();
-                    let token_b = *session.token.as_bytes();
-                    tokio::spawn(async move {
-                        target_to_client_loop(session_clone, sock_clone, token_b).await;
-                    });
+            (snell::quic::PacketKind::Data, Some(session)) => {
+                session.touch();
+                let _ = session.target_sock.send(&buf[..n]).await;
+            }
+            (snell::quic::PacketKind::Init, _) => {
+                if n < 16 + snell::cipher::HDR_CT_LEN + 16 {
+                    eprintln!("[QUIC] init too short from {src}");
+                    continue;
                 }
-            }
-        }
+                let salt: [u8; 16] = buf[..16].try_into().unwrap();
+                let req = match snell::quic::decrypt_init(&psk, &salt, &buf[16..n]) {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("[QUIC] decrypt fail from {src}: {e}"); continue; }
+                };
+                eprintln!("[QUIC] CONNECT_UDP from {src} -> {}:{}", req.host, req.port);
 
-        // Forward client → target
-        if snell::quic::is_quic_initial(&payload) {
-            match snell::quic::decrypt_with(&session.init_cipher, &payload) {
-                Ok(plain) => {
-                    let _ = session.target_sock.send(&plain).await;
+                // Resolve and SSRF-check
+                let target_addr: SocketAddr = match tokio::net::lookup_host(
+                    format!("{}:{}", req.host, req.port)
+                ).await.ok().and_then(|mut it| it.next()) {
+                    Some(a) => a,
+                    None    => continue,
+                };
+                if !is_safe_target(&target_addr) {
+                    eprintln!("[QUIC SSRF] blocked {target_addr}");
+                    continue;
                 }
-                Err(_) => continue, // drop malformed/forged
-            }
-        } else {
-            let _ = session.target_sock.send(&payload).await;
-        }
-    }
-}
 
-async fn target_to_client_loop(
-    session: Arc<UdpSession>,
-    sock: Arc<tokio::net::UdpSocket>,
-    token_bytes: [u8; 8],
-) {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        let n = match session.target_sock.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        let data = &buf[..n];
-        let dst = match *session.client_addr.lock().await {
-            Some(a) => a,
-            None => break, // shouldn't happen — task started after addr was set
-        };
-        let mut out =
-            Vec::with_capacity(8 + data.len() + snell::quic::QUIC_INIT_OVERHEAD);
-        out.extend_from_slice(&token_bytes);
-        if snell::quic::is_quic_initial(data) {
-            match snell::quic::encrypt_with(&session.init_cipher, data) {
-                Ok(enc) => out.extend_from_slice(&enc),
-                Err(_) => continue,
+                // Bind outbound UDP socket (with optional egress interface)
+                let target_sock = match snell::egress::bind_udp(
+                    "0.0.0.0:0".parse().expect("static"),
+                    iface.as_deref().map(String::as_str),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[QUIC] bind: {e}"); continue; }
+                };
+                if let Err(e) = target_sock.connect(target_addr).await {
+                    eprintln!("[QUIC] connect: {e}"); continue;
+                }
+                let target_sock = Arc::new(target_sock);
+
+                // If trailing data exists in init payload, forward it to target now.
+                if !req.trailing.is_empty() {
+                    let _ = target_sock.send(&req.trailing).await;
+                }
+
+                let session = Arc::new(UdpSession {
+                    client_addr: src,
+                    target_sock: target_sock.clone(),
+                    last_seen:   AtomicU64::new(0),
+                });
+                session.touch();
+                table.lock().await.insert(src, session.clone());
+
+                // Spawn target -> client forwarding task
+                let sock_back = sock.clone();
+                tokio::spawn(async move {
+                    let mut rbuf = vec![0u8; 65535];
+                    while let Ok(m) = target_sock.recv(&mut rbuf).await {
+                        if m == 0 { break; }
+                        if sock_back.send_to(&rbuf[..m], src).await.is_err() {
+                            break;
+                        }
+                        session.touch();
+                    }
+                });
             }
-        } else {
-            out.extend_from_slice(data);
         }
-        let _ = sock.send_to(&out, dst).await;
-        session.touch();
     }
 }
 
@@ -313,26 +316,36 @@ async fn dispatch(
     psk: &[u8],
     tls: &TlsAcceptor,
     iface: Option<&str>,
-    sessions: &SessionTable,
 ) -> Result<()> {
+    // Bound only the obfs handshake (peek + optional HTTP/TLS upgrade).
+    // The relay loop inside handle() must not be bounded.
+    let handshake_deadline = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+
     let mut first = [0u8; 1];
-    conn.peek(&mut first).await?;
+    tokio::time::timeout(handshake_deadline, conn.peek(&mut first))
+        .await
+        .map_err(|_| anyhow::anyhow!("obfs peek timeout"))??;
+
     match first[0] {
         0x16 => {
-            let stream = tls.accept(conn).await?;
-            handle(stream, psk, iface, sessions).await
+            let stream = tokio::time::timeout(handshake_deadline, tls.accept(conn))
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
+            handle(stream, psk, iface).await
         }
         b'G' => {
-            absorb_http_request(&mut conn).await?;
+            tokio::time::timeout(handshake_deadline, absorb_http_request(&mut conn))
+                .await
+                .map_err(|_| anyhow::anyhow!("HTTP obfs timeout"))??;
             conn.write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\n\
                   Upgrade: websocket\r\n\
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, sessions).await
+            handle(conn, psk, iface).await
         }
-        _ => handle(conn, psk, iface, sessions).await,
+        _ => handle(conn, psk, iface).await,
     }
 }
 
@@ -356,13 +369,18 @@ async fn handle<S>(
     mut conn: S,
     psk: &[u8],
     iface: Option<&str>,
-    sessions: &SessionTable,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Bound the initial salt-exchange read; the relay loop below must not be bounded.
     let mut client_salt = [0u8; SALT_LEN];
-    conn.read_exact(&mut client_salt).await?;
+    tokio::time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        conn.read_exact(&mut client_salt),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("salt-exchange timeout"))??;
     let mut c2s = SnellCipher::new(psk, &client_salt)?;
 
     let (server_salt, mut s2c) = SnellCipher::with_random_salt(psk)?;
@@ -377,62 +395,6 @@ where
         if req.command == CMD_PING {
             conn.write_all(&s2c.seal(&[RESP_PONG])?).await?;
             continue;
-        }
-
-        // ── QUIC UDP connect ──────────────────────────────────────────────────
-        if req.command == CMD_CONNECT_UDP {
-            let target_addr: SocketAddr =
-                tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("DNS: no address"))?;
-
-            if !is_safe_target(&target_addr) {
-                eprintln!(
-                    "[SSRF] blocked QUIC → {}:{} (resolved to {})",
-                    req.host, req.port, target_addr
-                );
-                let mut r = vec![RESP_ERROR, 0u8, 9];
-                r.extend_from_slice(b"forbidden");
-                conn.write_all(&s2c.seal(&r)?).await?;
-                return Ok(());
-            }
-
-            {
-                let guard = sessions.lock().await;
-                if guard.len() >= MAX_UDP_SESSIONS {
-                    let mut r = vec![RESP_ERROR, 0u8, 11];
-                    r.extend_from_slice(b"too busy now");
-                    conn.write_all(&s2c.seal(&r)?).await?;
-                    return Ok(());
-                }
-            }
-
-            let target_sock =
-                snell::egress::bind_udp("0.0.0.0:0".parse().expect("static"), iface)?;
-            target_sock.connect(target_addr).await?;
-
-            let mut session_salt = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut session_salt);
-            let init_cipher = snell::quic::derive_init_cipher(psk, &session_salt)?;
-
-            let token = SessionToken::new_random();
-            let session = Arc::new(UdpSession {
-                token,
-                client_addr: tokio::sync::Mutex::new(None),
-                target_sock: Arc::new(target_sock),
-                last_seen: std::sync::atomic::AtomicU64::new(0),
-                init_cipher,
-                recv_started: std::sync::atomic::AtomicBool::new(false),
-            });
-            session.touch();
-            sessions.lock().await.insert(token, session);
-
-            let mut resp = vec![RESP_TUNNEL];
-            resp.extend_from_slice(token.as_bytes());
-            resp.extend_from_slice(&session_salt); // client needs salt to derive same cipher
-            conn.write_all(&s2c.seal(&resp)?).await?;
-            return Ok(());
         }
 
         // ── Normal TCP CONNECT ────────────────────────────────────────────────

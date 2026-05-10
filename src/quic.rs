@@ -1,116 +1,94 @@
-//! QUIC Proxy Mode — UDP relay with selective encryption.
+//! Snell v5 QUIC Proxy Mode — verified wire format.
+//!
+//! Wire format (per UDP datagram):
+//!   [16B per-packet salt]
+//!   [23B AES-128-GCM(header_pt, key, nonce=0)]
+//!   [interleave_size bytes]
+//!   [payload_len + 16B AES-128-GCM(inner_pt, key, nonce=1)]
+//!
+//! KDF: argon2id(PSK, packet[:16], t=3, m=8KiB, p=1) -> 32B, take first 16B
+//! Cipher: AES-128-GCM, 12-byte LE nonce counter starting at 0
+//! Sessions: keyed by source sockaddr (IP:port)
+//!
+//! Packet classification (server-side, by byte[0] of full datagram):
+//!   byte[0] in [0x40..0x7F] or > 0xBF  -> DATA packet (raw forward)
+//!   byte[0] in [0x00..0x3F] or [0x80..0xBF] -> INIT (decrypt + create session)
 
-use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit, Nonce as GcmNonce};
-use anyhow::Result;
-use argon2::{Algorithm, Argon2, Params, Version};
-use rand::RngCore;
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
-/// Returns `true` if `b` looks like a QUIC v1 Initial packet (RFC 9000).
-pub fn is_quic_initial(b: &[u8]) -> bool {
-    if b.len() < 5 {
-        return false;
-    }
-    if b[0] & 0xC0 != 0xC0 {
-        return false;
-    } // Long Header + Fixed Bit
-    if b[0] & 0x30 != 0x00 {
-        return false;
-    } // Initial type
-    let version = u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
-    version != 0
+use crate::cipher::{SnellCipher, SALT_LEN, HDR_CT_LEN};
+
+/// QUIC mode CONNECT command — fixed to 0x01, no version byte.
+pub const QUIC_CMD_CONNECT: u8 = 0x01;
+
+/// Parsed QUIC init payload (different format from TCP — no version byte,
+/// no client_id, has user/SNI string instead).
+#[derive(Debug)]
+pub struct QuicRequest {
+    pub user:     String,
+    pub host:     String,
+    pub port:     u16,
+    /// App data following the CONNECT header.
+    pub trailing: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SessionToken(pub [u8; 8]);
-
-impl SessionToken {
-    pub fn new_random() -> Self {
-        let mut t = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut t);
-        Self(t)
+/// Parse a decrypted QUIC init payload.
+/// Format: [0x01][user_len][user][host_len][host][port BE u16][trailing...]
+pub fn parse_quic_request(data: &[u8]) -> anyhow::Result<QuicRequest> {
+    if data.len() < 2 { anyhow::bail!("QUIC payload too short"); }
+    if data[0] != QUIC_CMD_CONNECT {
+        anyhow::bail!("QUIC command must be 0x01, got {:#04x}", data[0]);
     }
-
-    pub fn as_bytes(&self) -> &[u8; 8] {
-        &self.0
-    }
+    let user_len = data[1] as usize;
+    if data.len() < 2 + user_len + 1 { anyhow::bail!("truncated user"); }
+    let user = std::str::from_utf8(&data[2..2 + user_len])?.to_owned();
+    let mut pos = 2 + user_len;
+    let host_len = data[pos] as usize;
+    pos += 1;
+    if data.len() < pos + host_len + 2 { anyhow::bail!("truncated host"); }
+    let host = std::str::from_utf8(&data[pos..pos + host_len])?.to_owned();
+    pos += host_len;
+    let port = u16::from_be_bytes([data[pos], data[pos + 1]]);
+    pos += 2;
+    Ok(QuicRequest { user, host, port, trailing: data[pos..].to_vec() })
 }
 
-impl std::fmt::Display for SessionToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketKind { Init, Data }
+
+/// Classify a UDP datagram by its first byte (matches snell-server v5 classifier).
+pub fn classify(packet: &[u8]) -> Option<PacketKind> {
+    if packet.is_empty() { return None; }
+    let b = packet[0];
+    if (0x40..=0x7F).contains(&b) || b > 0xBF {
+        Some(PacketKind::Data)
+    } else {
+        Some(PacketKind::Init)
     }
-}
-
-/// Pre-derive an AES-128-GCM cipher once for QUIC Initial packets.
-/// Avoids per-packet argon2id (DoS mitigation).
-pub fn derive_init_cipher(psk: &[u8], salt: &[u8]) -> Result<Aes128Gcm> {
-    let params = Params::new(8, 3, 1, Some(32)).expect("argon2 static params");
-    let mut key_mat = [0u8; 32];
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(psk, salt, &mut key_mat)
-        .map_err(|e| anyhow::anyhow!("argon2id: {e}"))?;
-    Aes128Gcm::new_from_slice(&key_mat[..16]).map_err(|_| anyhow::anyhow!("AES key"))
-}
-
-/// Wire format: [12-byte random nonce][AES-GCM CT + 16-byte tag].
-pub const QUIC_INIT_OVERHEAD: usize = 12 + 16;
-
-pub fn encrypt_with(cipher: &Aes128Gcm, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let ct = cipher
-        .encrypt(GcmNonce::from_slice(&nonce), plaintext)
-        .map_err(|_| anyhow::anyhow!("AEAD encrypt"))?;
-    let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
-    Ok(out)
-}
-
-pub fn decrypt_with(cipher: &Aes128Gcm, wire: &[u8]) -> Result<Vec<u8>> {
-    if wire.len() < QUIC_INIT_OVERHEAD {
-        anyhow::bail!("QUIC Initial too short");
-    }
-    let (nonce, ct) = wire.split_at(12);
-    cipher
-        .decrypt(GcmNonce::from_slice(nonce), ct)
-        .map_err(|_| anyhow::anyhow!("AEAD decrypt"))
 }
 
 pub struct UdpSession {
-    pub token: SessionToken,
-    /// Discovered from the first UDP datagram. None until then.
-    pub client_addr: Mutex<Option<SocketAddr>>,
+    pub client_addr: SocketAddr,
     pub target_sock: Arc<UdpSocket>,
-    /// epoch nanos — atomic so updates don't lock.
-    pub last_seen: AtomicU64,
-    /// Pre-derived once; per-session salt prevents key sharing across sessions.
-    pub init_cipher: Aes128Gcm,
-    /// Ensures the target→client recv task is spawned exactly once.
-    pub recv_started: AtomicBool,
+    pub last_seen:   AtomicU64,
 }
 
 impl UdpSession {
     pub fn touch(&self) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64).unwrap_or(0);
         self.last_seen.store(nanos, Ordering::Relaxed);
     }
 }
 
-pub type SessionTable = Arc<Mutex<HashMap<SessionToken, Arc<UdpSession>>>>;
+pub type SessionTable = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSession>>>>;
 
 pub fn new_session_table() -> SessionTable {
     Arc::new(Mutex::new(HashMap::new()))
@@ -118,13 +96,32 @@ pub fn new_session_table() -> SessionTable {
 
 /// Remove sessions idle for more than `timeout_secs` seconds.
 pub async fn gc_sessions(table: &SessionTable, timeout_secs: u64) {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let cutoff = now_nanos.saturating_sub(timeout_secs * 1_000_000_000);
-    let mut guard = table.lock().await;
-    guard.retain(|_, s| s.last_seen.load(Ordering::Relaxed) >= cutoff);
+    let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let cutoff = now_nanos.saturating_sub(timeout_secs.saturating_mul(1_000_000_000));
+    table.lock().await.retain(|_, s| s.last_seen.load(Ordering::Relaxed) >= cutoff);
+}
+
+/// Decrypt the init datagram payload after stripping the 16-byte salt.
+/// Returns the parsed Snell request from the first chunk.
+///
+/// `data_after_salt` is the bytes AFTER the 16-byte salt. It must contain at
+/// least one full chunk: [23B header CT][interleave bytes][payload_len + 16B].
+pub fn decrypt_init(psk: &[u8], salt: &[u8; SALT_LEN], data_after_salt: &[u8])
+    -> Result<QuicRequest>
+{
+    let mut cipher = SnellCipher::new(psk, salt)?;
+    if data_after_salt.len() < HDR_CT_LEN { bail!("init datagram too short"); }
+    let hdr_ct: [u8; HDR_CT_LEN] = data_after_salt[..HDR_CT_LEN].try_into().unwrap();
+    let (interleave, payload_len) = match cipher.open_header(&hdr_ct)? {
+        Some(t) => t,
+        None    => bail!("zero chunk as init handshake"),
+    };
+    let payload_start = HDR_CT_LEN + interleave;
+    let payload_end   = payload_start + payload_len + 16;
+    if data_after_salt.len() < payload_end { bail!("init datagram truncated"); }
+    let payload_pt = cipher.open_payload(&data_after_salt[payload_start..payload_end])?;
+    parse_quic_request(&payload_pt)
 }
 
 #[cfg(test)]
@@ -132,53 +129,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_quic_initial() {
-        let mut p = vec![0u8; 20];
-        p[0] = 0xC0;
-        p[4] = 0x01;
-        assert!(is_quic_initial(&p));
+    fn classify_data_short_header() {
+        let mut p = vec![0u8; 20]; p[0] = 0x55;
+        assert_eq!(classify(&p), Some(PacketKind::Data));
     }
 
     #[test]
-    fn rejects_short() {
-        assert!(!is_quic_initial(&[0xC0, 0, 0, 0]));
+    fn classify_data_long_header_not_initial() {
+        let mut p = vec![0u8; 20]; p[0] = 0xD0;
+        assert_eq!(classify(&p), Some(PacketKind::Data));
     }
 
     #[test]
-    fn rejects_short_header_byte() {
-        let mut p = vec![0u8; 20];
-        p[0] = 0x40;
-        assert!(!is_quic_initial(&p));
+    fn classify_init() {
+        let mut p = vec![0u8; 20]; p[0] = 0x20;
+        assert_eq!(classify(&p), Some(PacketKind::Init));
     }
 
     #[test]
-    fn rejects_non_initial() {
-        let mut p = vec![0u8; 20];
-        p[0] = 0xD0;
-        p[4] = 1;
-        assert!(!is_quic_initial(&p));
+    fn classify_init_high_range() {
+        let mut p = vec![0u8; 20]; p[0] = 0xA0;
+        assert_eq!(classify(&p), Some(PacketKind::Init));
     }
 
     #[test]
-    fn rejects_version_negotiation() {
-        let mut p = vec![0u8; 20];
-        p[0] = 0xC0;
-        assert!(!is_quic_initial(&p));
-    }
-
-    #[test]
-    fn encrypt_decrypt_roundtrip() {
-        let cipher = derive_init_cipher(b"psk", &[1u8; 16]).unwrap();
-        let pt = b"QUIC Initial";
-        let wire = encrypt_with(&cipher, pt).unwrap();
-        let back = decrypt_with(&cipher, &wire).unwrap();
-        assert_eq!(&back, pt);
-    }
-
-    #[test]
-    fn token_roundtrip() {
-        let t = SessionToken::new_random();
-        assert_eq!(t.as_bytes().len(), 8);
-        assert_eq!(format!("{t}").len(), 16);
+    fn classify_empty() {
+        assert_eq!(classify(&[]), None);
     }
 }
