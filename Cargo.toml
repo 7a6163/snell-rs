@@ -1,6 +1,6 @@
 [package]
 name = "snell-rs"
-version = "0.1.0"
+version = "5.0.1"
 edition = "2024"
 description = "Open-source Snell v5 proxy protocol implementation"
 
