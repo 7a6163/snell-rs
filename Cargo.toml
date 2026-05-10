@@ -1,0 +1,26 @@
+[package]
+name = "snell-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Open-source Snell v5 proxy protocol implementation"
+
+[lib]
+name = "snell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snell-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "snell-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+tokio        = { version = "1", features = ["full"] }
+argon2       = "0.5"
+aes-gcm      = "0.10"
+rand         = "0.8"
+anyhow       = "1"
+tokio-rustls = "0.24"
+rcgen        = "0.11"
