@@ -108,19 +108,11 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8]) -> Result<
     hs.push((port & 0xff) as u8);
     remote.write_all(&c2s.seal(&hs)?).await?;
 
-    // Read server salt + ResponseTunnel
-    let mut ss = [0u8; SALT_LEN];
-    remote.read_exact(&mut ss).await?;
-    let mut s2c = SnellCipher::new(psk, &ss)?;
-
-    let Some(resp) = read_chunk(&mut remote, &mut s2c).await? else {
-        bail!("server closed before response");
-    };
-    if resp.first() != Some(&RESP_TUNNEL) {
-        bail!("expected ResponseTunnel, got {:?}", resp.first());
-    }
-
-    // Bidirectional relay
+    // Official snell-server v5 doesn't send the server salt upfront — it
+    // waits for the target to produce data, then sends [server_salt][RESP_TUNNEL
+    // + target_data] together. So salt-reading must happen in the down task,
+    // concurrently with the up task that forwards local data to remote.
+    let psk_arc = psk.to_vec();
     let (mut lr, mut lw) = local.split();
     let (mut rr, mut rw) = remote.split();
 
@@ -137,9 +129,22 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8]) -> Result<
         Ok::<_, anyhow::Error>(())
     };
     let down = async move {
+        let mut ss = [0u8; SALT_LEN];
+        rr.read_exact(&mut ss).await?;
+        let mut s2c = SnellCipher::new(&psk_arc, &ss)?;
+        let mut first = true;
         loop {
             match read_chunk(&mut rr, &mut s2c).await? {
                 None => break,
+                Some(d) if first => {
+                    first = false;
+                    if d.first() != Some(&RESP_TUNNEL) {
+                        anyhow::bail!("expected ResponseTunnel, got {:?}", d.first());
+                    }
+                    if d.len() > 1 {
+                        lw.write_all(&d[1..]).await?;
+                    }
+                }
                 Some(d) => lw.write_all(&d).await?,
             }
         }
