@@ -1,35 +1,15 @@
-# snell-rs — Snell v5 proxy server.
-#
-# Usage:
-#   cp .env.example .env
-#   # edit .env: at minimum set PSK
-#   docker compose up -d
-#
-# All settings are read from .env (auto-loaded by docker compose).
-
 services:
   snell:
     image: ghcr.io/7a6163/snell:${TAG:-latest}
     container_name: ${CONTAINER_NAME:-snell}
-    restart: unless-stopped
+    restart: always
     ports:
       - "${PORT:-6180}:6180/tcp"
       - "${PORT:-6180}:6180/udp"
     environment:
-      # Required — server exits if unset or shorter than 16 chars.
-      PSK: ${PSK:?PSK is required (min 16 chars). See .env.example.}
-
-      # Optional — set to "1" to enable QUIC proxy mode (UDP listener).
+      PSK: ${PSK:?PSK required (min 16 chars)}
       QUIC: ${QUIC:-0}
-
-      # Optional — bind outgoing connections to this network interface.
-      # Requires CAP_NET_RAW (added below) on Linux.
       EGRESS_INTERFACE: ${EGRESS_INTERFACE:-}
-
-      # Optional — set to "1" to allow CONNECT to loopback / private ranges.
-      # Use only for local testing. Default off (SSRF guard active).
       ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-0}
-
-    # Needed only if EGRESS_INTERFACE is set — for SO_BINDTODEVICE.
     cap_add:
       - NET_RAW
