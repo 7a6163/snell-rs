@@ -57,12 +57,12 @@ jobs:
           cp target/${{ matrix.target }}/release/snell-server dist/
           cp target/${{ matrix.target }}/release/snell-client dist/
           cp README.md LICENSE* dist/ 2>/dev/null || true
-          tar czf snell-rs-${{ matrix.target }}.tar.gz -C dist .
+          tar czf snell-${{ matrix.target }}.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: snell-rs-${{ matrix.target }}
-          path: snell-rs-${{ matrix.target }}.tar.gz
+          name: snell-${{ matrix.target }}
+          path: snell-${{ matrix.target }}.tar.gz
           retention-days: 7
 
   release:
@@ -109,8 +109,8 @@ jobs:
       - name: Prepare Docker context
         run: |
           mkdir -p ctx/amd64 ctx/arm64
-          tar xzf artifacts/snell-rs-x86_64-unknown-linux-musl.tar.gz -C ctx/amd64
-          tar xzf artifacts/snell-rs-aarch64-unknown-linux-musl.tar.gz -C ctx/arm64
+          tar xzf artifacts/snell-x86_64-unknown-linux-musl.tar.gz -C ctx/amd64
+          tar xzf artifacts/snell-aarch64-unknown-linux-musl.tar.gz -C ctx/arm64
           ls -la ctx/amd64 ctx/arm64
 
       - uses: docker/setup-qemu-action@v3
@@ -125,7 +125,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/snell
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
