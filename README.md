@@ -70,11 +70,43 @@ PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
 
 ### Client
 
+`snell-client` is a local SOCKS5 proxy that tunnels traffic to a Snell server. Useful for routing specific apps through a Snell server, or for verifying a `snell-server` deployment without a Surge license.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PSK` | ✅ | — | Pre-shared key |
-| `SNELL_SERVER` | — | `127.0.0.1:6180` | Snell server address |
-| `LISTEN` | — | `127.0.0.1:1080` | Local SOCKS5 listen address |
+| `PSK` | ✅ | — | Must match the server's PSK |
+| `SNELL_SERVER` | — | `127.0.0.1:6180` | Snell server `host:port` |
+| `LISTEN` | — | `127.0.0.1:1080` | Local SOCKS5 bind address |
+
+**Run:**
+
+```bash
+PSK=your-preshared-key \
+SNELL_SERVER=your-server-ip:6180 \
+LISTEN=127.0.0.1:1080 \
+./snell-client
+```
+
+**Examples:**
+
+```bash
+# curl through the proxy (use --socks5-hostname so DNS goes through the tunnel)
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+
+# Route a single app via proxychains
+proxychains4 -q ./your-app
+
+# System-wide SOCKS5 on macOS
+networksetup -setsocksfirewallproxy "Wi-Fi" 127.0.0.1 1080
+
+# Disable when done
+networksetup -setsocksfirewallproxystate "Wi-Fi" off
+```
+
+**Notes:**
+
+- Plain Snell only — no client-side obfuscation. If the server is reached via `obfs=http` or `obfs=tls`, use Surge as the client instead.
+- Supports Snell v5 connection reuse for lower per-request latency.
 
 ## Obfuscation
 
