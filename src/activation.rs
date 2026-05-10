@@ -21,18 +21,21 @@ pub fn take_listener_fds() -> Vec<RawFd> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-
-    std::env::remove_var("LISTEN_PID");
-    std::env::remove_var("LISTEN_FDS");
-
-    if listen_pid != our_pid {
-        return vec![];
-    }
-
     let n: u32 = std::env::var("LISTEN_FDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+
+    // SAFETY: called at startup before any threads are spawned, so no
+    // concurrent env reads can race with this write (sd_listen_fds convention).
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+    }
+
+    if listen_pid != our_pid {
+        return vec![];
+    }
 
     (3..3 + n).map(|fd| fd as RawFd).collect()
 }
