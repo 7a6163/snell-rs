@@ -17,7 +17,7 @@ Compatible with [Surge](https://nssurge.com) as a Snell v5 server.
 ## Build
 
 ```bash
-# Requires Rust 1.85+
+# Requires Rust 1.95+ (pinned via rust-toolchain.toml)
 cargo build --release
 ```
 

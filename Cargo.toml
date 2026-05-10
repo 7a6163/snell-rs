@@ -2,6 +2,7 @@
 name = "snell-rs"
 version = "5.0.1"
 edition = "2024"
+rust-version = "1.95"
 description = "Open-source Snell v5 proxy protocol implementation"
 
 [lib]
