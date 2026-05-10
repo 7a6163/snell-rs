@@ -79,13 +79,17 @@ async fn quic_e2e_init_data_response() {
     let cli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let init = build_quic_init(PSK.as_bytes(), "127.0.0.1", echo_port);
-    cli.send_to(&init, ("127.0.0.1", server_port)).await.unwrap();
+    cli.send_to(&init, ("127.0.0.1", server_port))
+        .await
+        .unwrap();
 
     sleep(Duration::from_millis(300)).await;
 
     let payload = b"hello-quic-from-test";
     let data_pkt = build_quic_data(payload);
-    cli.send_to(&data_pkt, ("127.0.0.1", server_port)).await.unwrap();
+    cli.send_to(&data_pkt, ("127.0.0.1", server_port))
+        .await
+        .unwrap();
 
     let mut buf = vec![0u8; 1500];
     let (n, _src) = timeout(Duration::from_secs(3), cli.recv_from(&mut buf))
@@ -94,7 +98,10 @@ async fn quic_e2e_init_data_response() {
         .expect("recv error");
 
     let recv = &buf[..n];
-    assert!(recv.starts_with(b"ECHO:"), "expected ECHO: prefix: {recv:?}");
+    assert!(
+        recv.starts_with(b"ECHO:"),
+        "expected ECHO: prefix: {recv:?}"
+    );
     assert!(
         recv.windows(payload.len()).any(|w| w == payload),
         "echoed payload missing in {recv:?}",
