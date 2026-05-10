@@ -1,9 +1,9 @@
 //! snell-client — Snell v5 SOCKS5 proxy client.
 //! Usage: PSK=yourpsk SNELL_SERVER=host:port [LISTEN=127.0.0.1:1080] snell-client
 
-use anyhow::{bail, Result};
-use snell::cipher::{SnellCipher, SALT_LEN};
-use snell::snell::{read_chunk, write_chunk, RESP_TUNNEL};
+use anyhow::{Result, bail};
+use snell::cipher::{SALT_LEN, SnellCipher};
+use snell::snell::{RESP_TUNNEL, read_chunk, write_chunk};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

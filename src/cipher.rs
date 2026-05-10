@@ -7,10 +7,10 @@
 //!   Header plaintext: [0x04][0x00][0x00][interleave_size BE 2B][payload_len BE 2B]
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes128Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
 

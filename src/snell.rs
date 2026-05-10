@@ -1,7 +1,7 @@
 //! Snell v5 protocol layer — wire format identical to v3.
 
-use crate::cipher::{SnellCipher, HDR_CT_LEN};
-use anyhow::{bail, Result};
+use crate::cipher::{HDR_CT_LEN, SnellCipher};
+use anyhow::{Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const CMD_PING: u8 = 0x00;
