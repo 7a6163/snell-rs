@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_CONNECT_V2: u8 = 0x05;
+pub const CMD_CONNECT_UDP: u8 = 0x06;
 pub const RESP_TUNNEL: u8 = 0x00;
 pub const RESP_PONG: u8 = 0x01;
 pub const RESP_ERROR: u8 = 0x02;
@@ -100,6 +101,20 @@ pub async fn write_chunk<W: AsyncWriteExt + Unpin>(
     data: &[u8],
 ) -> Result<()> {
     for chunk in data.chunks(0x3fff) {
+        w.write_all(&cipher.seal(chunk)?).await?;
+    }
+    Ok(())
+}
+
+/// Like `write_chunk` but limits each chunk to `max_bytes` (used by adaptive sizer).
+pub async fn write_chunk_sized<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    cipher: &mut SnellCipher,
+    data: &[u8],
+    max_bytes: usize,
+) -> Result<()> {
+    let cap = max_bytes.min(0x3fff);
+    for chunk in data.chunks(cap) {
         w.write_all(&cipher.seal(chunk)?).await?;
     }
     Ok(())
