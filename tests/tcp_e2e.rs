@@ -58,6 +58,7 @@ async fn socks5_connect(socks_port: u16, host: &str, target_port: u16) -> TcpStr
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn tcp_e2e_socks5_to_echo() {
     let echo_port = spawn_echo().await;
     let server_port = random_tcp_port();
@@ -83,6 +84,7 @@ async fn tcp_e2e_socks5_to_echo() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn tcp_e2e_multiple_requests() {
     let echo_port = spawn_echo().await;
     let server_port = random_tcp_port();

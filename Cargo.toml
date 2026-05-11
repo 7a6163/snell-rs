@@ -27,3 +27,6 @@ tokio-rustls = "0.26"
 rcgen        = "0.13"
 socket2      = { version = "0.5", features = ["all"] }
 libc         = "0.2"
+
+[dev-dependencies]
+serial_test  = "3"
