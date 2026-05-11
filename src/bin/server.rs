@@ -65,6 +65,20 @@ async fn async_main(activation_fds: Vec<i32>) -> Result<()> {
 }
 
 async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<()> {
+    // Graceful shutdown on SIGTERM/SIGINT so atexit handlers run
+    // (systemd restart lifecycle + LLVM coverage profile flush during tests).
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        std::process::exit(0);
+    });
+
     let listen: SocketAddr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:6180".into())

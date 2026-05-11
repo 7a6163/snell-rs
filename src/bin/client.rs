@@ -12,6 +12,20 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Graceful shutdown on SIGTERM/SIGINT so atexit handlers run
+    // (systemd restart lifecycle + LLVM coverage profile flush during tests).
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        std::process::exit(0);
+    });
+
     let server: SocketAddr = std::env::var("SNELL_SERVER")
         .unwrap_or_else(|_| "127.0.0.1:6180".into())
         .parse()?;

@@ -41,6 +41,22 @@ pub struct ChildGuard(pub Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        // Send SIGTERM and wait briefly so the child's atexit handlers run
+        // (notably LLVM coverage's profile-flush hook). SIGKILL via
+        // start_kill() would drop the .profraw and zero out bin coverage.
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            // SAFETY: pid comes from a live Child; SIGTERM is a defined signal.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            for _ in 0..40 {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let _ = self.0.start_kill();
     }
 }
