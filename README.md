@@ -1,5 +1,7 @@
 # snell-rs
 
+[![codecov](https://codecov.io/gh/7a6163/snell-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/7a6163/snell-rs)
+
 Open-source Snell v5 proxy server and client, written in Rust.
 
 Compatible with [Surge](https://nssurge.com) as a Snell v5 server.
