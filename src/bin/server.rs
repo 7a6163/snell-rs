@@ -570,3 +570,180 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 443)
+    }
+
+    fn v6(s: &str) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()), 443)
+    }
+
+    #[test]
+    fn allow_private_flag_bypasses_all_checks() {
+        assert!(is_safe_target(&v4(127, 0, 0, 1), true));
+        assert!(is_safe_target(&v4(10, 0, 0, 1), true));
+        assert!(is_safe_target(&v4(0, 0, 0, 0), true));
+        assert!(is_safe_target(&v6("::1"), true));
+        assert!(is_safe_target(&v6("fc00::1"), true));
+    }
+
+    #[test]
+    fn rejects_ipv4_loopback() {
+        assert!(!is_safe_target(&v4(127, 0, 0, 1), false));
+        assert!(!is_safe_target(&v4(127, 255, 255, 254), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_loopback() {
+        assert!(!is_safe_target(&v6("::1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_multicast() {
+        assert!(!is_safe_target(&v4(224, 0, 0, 1), false));
+        assert!(!is_safe_target(&v4(239, 255, 255, 255), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_multicast() {
+        assert!(!is_safe_target(&v6("ff00::1"), false));
+        assert!(!is_safe_target(&v6("ff02::1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_unspecified() {
+        assert!(!is_safe_target(&v4(0, 0, 0, 0), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_unspecified() {
+        assert!(!is_safe_target(&v6("::"), false));
+    }
+
+    #[test]
+    fn rejects_rfc1918_ten_dot() {
+        assert!(!is_safe_target(&v4(10, 0, 0, 1), false));
+        assert!(!is_safe_target(&v4(10, 255, 255, 255), false));
+    }
+
+    #[test]
+    fn rejects_rfc1918_172_16_through_172_31() {
+        assert!(!is_safe_target(&v4(172, 16, 0, 0), false));
+        assert!(!is_safe_target(&v4(172, 31, 255, 255), false));
+    }
+
+    #[test]
+    fn accepts_172_just_below_rfc1918_range() {
+        // 172.15.x.x is public, not RFC 1918.
+        assert!(is_safe_target(&v4(172, 15, 0, 1), false));
+    }
+
+    #[test]
+    fn accepts_172_just_above_rfc1918_range() {
+        // 172.32.x.x is public, not RFC 1918.
+        assert!(is_safe_target(&v4(172, 32, 0, 1), false));
+    }
+
+    #[test]
+    fn rejects_rfc1918_192_168() {
+        assert!(!is_safe_target(&v4(192, 168, 0, 1), false));
+        assert!(!is_safe_target(&v4(192, 168, 255, 255), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_link_local() {
+        assert!(!is_safe_target(&v4(169, 254, 0, 1), false));
+        assert!(!is_safe_target(&v4(169, 254, 255, 254), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_broadcast() {
+        assert!(!is_safe_target(&v4(255, 255, 255, 255), false));
+    }
+
+    #[test]
+    fn rejects_this_host_zero_slash_eight() {
+        // 0.0.0.0/8 — "this host on this network" (RFC 1122).
+        assert!(!is_safe_target(&v4(0, 1, 2, 3), false));
+        assert!(!is_safe_target(&v4(0, 255, 255, 255), false));
+    }
+
+    #[test]
+    fn rejects_cgnat_lower_bound() {
+        // 100.64.0.0/10 — CGNAT (RFC 6598).
+        assert!(!is_safe_target(&v4(100, 64, 0, 0), false));
+    }
+
+    #[test]
+    fn rejects_cgnat_upper_bound() {
+        assert!(!is_safe_target(&v4(100, 127, 255, 255), false));
+    }
+
+    #[test]
+    fn accepts_just_below_cgnat_range() {
+        assert!(is_safe_target(&v4(100, 63, 255, 255), false));
+    }
+
+    #[test]
+    fn accepts_just_above_cgnat_range() {
+        assert!(is_safe_target(&v4(100, 128, 0, 0), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_unique_local_fc00() {
+        assert!(!is_safe_target(&v6("fc00::1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_unique_local_fd00() {
+        // fd00::/8 falls inside fc00::/7.
+        assert!(!is_safe_target(&v6("fd12:3456:789a::1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv6_link_local_fe80() {
+        assert!(!is_safe_target(&v6("fe80::1"), false));
+        assert!(!is_safe_target(&v6("febf:ffff::1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_loopback() {
+        // C-1: ::ffff:127.0.0.1 must unwrap and re-apply IPv4 rules.
+        assert!(!is_safe_target(&v6("::ffff:127.0.0.1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_private() {
+        assert!(!is_safe_target(&v6("::ffff:192.168.1.1"), false));
+        assert!(!is_safe_target(&v6("::ffff:10.0.0.1"), false));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_cgnat() {
+        assert!(!is_safe_target(&v6("::ffff:100.64.0.1"), false));
+    }
+
+    #[test]
+    fn accepts_ipv4_mapped_public() {
+        // C-1: ::ffff:8.8.8.8 must unwrap to a public IPv4 and pass.
+        assert!(is_safe_target(&v6("::ffff:8.8.8.8"), false));
+    }
+
+    #[test]
+    fn accepts_public_ipv4() {
+        assert!(is_safe_target(&v4(8, 8, 8, 8), false));
+        assert!(is_safe_target(&v4(1, 1, 1, 1), false));
+    }
+
+    #[test]
+    fn accepts_public_ipv6() {
+        assert!(is_safe_target(&v6("2606:4700:4700::1111"), false));
+        assert!(is_safe_target(&v6("2001:4860:4860::8888"), false));
+    }
+}
