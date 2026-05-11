@@ -8,7 +8,7 @@
 
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
 };
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -56,41 +56,55 @@ impl SnellCipher {
     }
 
     /// Seal plaintext into a v5 chunk (interleave_size = 0).
+    ///
+    /// Encrypts header and payload in place inside the output buffer to avoid
+    /// the intermediate `Vec<u8>` that `Aead::encrypt` would otherwise return.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         if plaintext.len() > 0xffff {
             bail!("plaintext too large: {} bytes (max 65535)", plaintext.len());
         }
         let n = plaintext.len();
-        let hdr = [0x04u8, 0, 0, 0, 0, (n >> 8) as u8, (n & 0xff) as u8];
 
-        // Single pre-allocated buffer — avoids two intermediate Vec allocations.
+        // Layout: [hdr_pt(7) | hdr_tag(16) | payload_pt(n) | payload_tag(16)]
         let mut out = Vec::with_capacity(HDR_CT_LEN + n + 16);
-        out.extend_from_slice(
-            &self
-                .aead
-                .encrypt(Nonce::from_slice(&self.nonce), hdr.as_slice())
-                .map_err(|_| anyhow::anyhow!("header AEAD encrypt"))?,
-        );
+
+        // Header plaintext → encrypt in place → append 16-byte tag.
+        out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, (n >> 8) as u8, (n & 0xff) as u8]);
+        let hdr_tag = self
+            .aead
+            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], &mut out[..7])
+            .map_err(|_| anyhow::anyhow!("header AEAD encrypt"))?;
+        out.extend_from_slice(&hdr_tag);
         self.inc();
-        out.extend_from_slice(
-            &self
-                .aead
-                .encrypt(Nonce::from_slice(&self.nonce), plaintext)
-                .map_err(|_| anyhow::anyhow!("payload AEAD encrypt"))?,
-        );
+
+        // Payload plaintext → encrypt in place → append 16-byte tag.
+        let pl_start = HDR_CT_LEN;
+        out.extend_from_slice(plaintext);
+        let pl_tag = self
+            .aead
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&self.nonce),
+                &[],
+                &mut out[pl_start..pl_start + n],
+            )
+            .map_err(|_| anyhow::anyhow!("payload AEAD encrypt"))?;
+        out.extend_from_slice(&pl_tag);
         self.inc();
+
         Ok(out)
     }
 
     /// Zero chunk — signals end of a multiplexed session.
     pub fn seal_zero(&mut self) -> Result<Vec<u8>> {
-        let hdr = [0x04u8, 0, 0, 0, 0, 0, 0];
-        let ct = self
+        let mut out = Vec::with_capacity(HDR_CT_LEN);
+        out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, 0, 0]);
+        let tag = self
             .aead
-            .encrypt(Nonce::from_slice(&self.nonce), hdr.as_slice())
+            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], &mut out[..7])
             .map_err(|_| anyhow::anyhow!("zero-chunk AEAD encrypt"))?;
+        out.extend_from_slice(&tag);
         self.inc();
-        Ok(ct)
+        Ok(out)
     }
 
     /// Decrypt 23-byte header CT → (interleave_size, payload_len).

@@ -87,7 +87,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let psk_str = std::env::var("PSK")
         .map_err(|_| anyhow::anyhow!("PSK environment variable is required"))?;
     if psk_str.len() < 16 {
-        anyhow::bail!("PSK must be at least 16 characters (got {})", psk_str.len());
+        anyhow::bail!("PSK must be at least 16 bytes (got {})", psk_str.len());
     }
     let psk = Arc::new(psk_str.into_bytes());
 
@@ -233,7 +233,7 @@ fn spawn_udp_listener(
 fn is_safe_v4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
     // Block: loopback, private, link-local, broadcast, this-host (0.0.0.0/8),
-    // CGNAT (100.64.0.0/10), unspecified.
+    // CGNAT (100.64.0.0/10), IETF Protocol Assignments (192.0.0.0/24), unspecified.
     !v4.is_loopback()
         && !v4.is_private()
         && !v4.is_link_local()
@@ -241,6 +241,7 @@ fn is_safe_v4(v4: Ipv4Addr) -> bool {
         && !v4.is_unspecified()
         && (octets[0] != 0) // 0.0.0.0/8 this-host (RFC 1122)
         && !(octets[0] == 100 && (octets[1] & 0xC0) == 64) // 100.64.0.0/10 CGNAT (RFC 6598)
+        && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 IETF Protocol Assignments (RFC 6890)
 }
 
 /// Returns false for addresses that should never be proxy targets (SSRF guard).
@@ -692,6 +693,21 @@ mod tests {
     fn rejects_cgnat_lower_bound() {
         // 100.64.0.0/10 — CGNAT (RFC 6598).
         assert!(!is_safe_target(&v4(100, 64, 0, 0), false));
+    }
+
+    #[test]
+    fn rejects_ietf_protocol_assignments_192_0_0() {
+        // 192.0.0.0/24 — IETF Protocol Assignments (RFC 6890).
+        assert!(!is_safe_target(&v4(192, 0, 0, 0), false));
+        assert!(!is_safe_target(&v4(192, 0, 0, 255), false));
+    }
+
+    #[test]
+    fn accepts_just_outside_ietf_assignments_range() {
+        // 192.0.1.0 is just outside /24, must pass.
+        assert!(is_safe_target(&v4(192, 0, 1, 0), false));
+        // 191.255.255.255 just below, must pass.
+        assert!(is_safe_target(&v4(191, 255, 255, 255), false));
     }
 
     #[test]
