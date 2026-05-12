@@ -35,7 +35,10 @@ pub struct SaltCache {
 
 impl SaltCache {
     pub fn new() -> Self {
-        Self::with_capacity(SALT_CACHE_CAPACITY, Duration::from_secs(SALT_CACHE_TTL_SECS))
+        Self::with_capacity(
+            SALT_CACHE_CAPACITY,
+            Duration::from_secs(SALT_CACHE_TTL_SECS),
+        )
     }
 
     pub fn with_capacity(capacity: usize, ttl: Duration) -> Self {

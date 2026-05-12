@@ -68,7 +68,9 @@ async fn tcp_handshake_replay_is_rejected() {
 
     // First attempt: cache the salt by completing the salt-read on the server.
     {
-        let mut s = TcpStream::connect(("127.0.0.1", server_port)).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
         s.write_all(&handshake).await.unwrap();
         // Give the server a moment to read the salt + insert into cache.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -76,7 +78,9 @@ async fn tcp_handshake_replay_is_rejected() {
     }
 
     // Second attempt with the *same* bytes — must be rejected.
-    let mut s = TcpStream::connect(("127.0.0.1", server_port)).await.unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", server_port))
+        .await
+        .unwrap();
     s.write_all(&handshake).await.unwrap();
 
     // Replay rejection => server bails immediately => our read returns 0 (EOF)
@@ -84,7 +88,7 @@ async fn tcp_handshake_replay_is_rejected() {
     // (or a hang past the timeout) means the guard didn't fire.
     let mut buf = [0u8; 64];
     match timeout(Duration::from_secs(2), s.read(&mut buf)).await {
-        Ok(Ok(0)) => {} // EOF — server closed the replayed connection.
+        Ok(Ok(0)) => {}  // EOF — server closed the replayed connection.
         Ok(Err(_)) => {} // Connection reset — also acceptable.
         Ok(Ok(n)) => panic!("server returned {n} bytes on replay; expected immediate close"),
         Err(_) => panic!("server did not close replay connection within 2s"),
@@ -105,7 +109,9 @@ async fn fresh_salts_both_accepted() {
 
     for _ in 0..2 {
         let (handshake, _) = build_handshake(PSK.as_bytes(), "127.0.0.1", target_port);
-        let mut s = TcpStream::connect(("127.0.0.1", server_port)).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
         s.write_all(&handshake).await.unwrap();
         // Brief read window — server should NOT close immediately; if the salt
         // is fresh it'll be busy setting up the relay.

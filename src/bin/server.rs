@@ -236,8 +236,16 @@ fn spawn_udp_listener(
 ) {
     let sock = Arc::new(sock);
     tokio::spawn(async move {
-        if let Err(e) =
-            run_udp_relay(sock, table, psk, iface, block_private, init_cooldown, salt_cache).await
+        if let Err(e) = run_udp_relay(
+            sock,
+            table,
+            psk,
+            iface,
+            block_private,
+            init_cooldown,
+            salt_cache,
+        )
+        .await
         {
             eprintln!("[QUIC UDP] {e}");
         }
