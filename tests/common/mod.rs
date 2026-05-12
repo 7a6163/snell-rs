@@ -66,8 +66,9 @@ pub fn spawn_server(listen_port: u16, quic: bool) -> ChildGuard {
     let mut cmd = Command::new(bin);
     cmd.arg(format!("0.0.0.0:{listen_port}"))
         .env("PSK", PSK)
-        .env("ALLOW_PRIVATE_TARGETS", "1")
         .kill_on_drop(true);
+    // Note: as of v5.2.0 the SSRF guard is off by default, so we no longer need
+    // to set BLOCK_PRIVATE_TARGETS=0 — proxying to 127.0.0.1 just works.
     if quic {
         cmd.env("QUIC", "1");
     }

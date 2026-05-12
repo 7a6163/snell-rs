@@ -6,7 +6,8 @@
 //!   PSK                   Pre-shared key (required, min 16 chars)
 //!   EGRESS_INTERFACE      Bind outgoing connections to this network interface
 //!   QUIC=1                Enable QUIC proxy mode (opens UDP on same port)
-//!   ALLOW_PRIVATE_TARGETS=1  Allow connecting to loopback/private addresses
+//!   BLOCK_PRIVATE_TARGETS=1  Refuse to proxy to loopback/private/reserved addresses
+//!                            (default: allow — proxying to LAN is a legit use case)
 //!
 //! Obfuscation auto-detected from first byte:
 //!   plain    — random Snell salt
@@ -93,8 +94,11 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
 
     let egress_iface: Option<Arc<String>> = std::env::var("EGRESS_INTERFACE").ok().map(Arc::new);
     let quic_enabled = std::env::var("QUIC").map(|v| v == "1").unwrap_or(false);
-    // C-4: Read ALLOW_PRIVATE_TARGETS once at startup instead of on every call.
-    let allow_private = std::env::var("ALLOW_PRIVATE_TARGETS")
+    // C-4: Read BLOCK_PRIVATE_TARGETS once at startup instead of on every call.
+    // Default is false (allow private targets) — this is a proxy tool and LAN
+    // access is a legitimate use case. Set BLOCK_PRIVATE_TARGETS=1 for hardened
+    // VPS deployments where the server is exposed to the internet.
+    let block_private = std::env::var("BLOCK_PRIVATE_TARGETS")
         .map(|v| v == "1")
         .unwrap_or(false);
 
@@ -124,7 +128,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                     session_table.clone(),
                     psk.clone(),
                     egress_iface.clone(),
-                    allow_private,
+                    block_private,
                     init_cooldown.clone(),
                 );
             }
@@ -143,7 +147,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 session_table.clone(),
                 psk.clone(),
                 egress_iface.clone(),
-                allow_private,
+                block_private,
                 init_cooldown.clone(),
             );
         }
@@ -191,7 +195,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 &psk,
                 &tls_acceptor,
                 iface.as_deref().map(String::as_str),
-                allow_private,
+                block_private,
             )
             .await
             {
@@ -218,12 +222,12 @@ fn spawn_udp_listener(
     table: SessionTable,
     psk: Arc<Vec<u8>>,
     iface: Option<Arc<String>>,
-    allow_private: bool,
+    block_private: bool,
     init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
 ) {
     let sock = Arc::new(sock);
     tokio::spawn(async move {
-        if let Err(e) = run_udp_relay(sock, table, psk, iface, allow_private, init_cooldown).await {
+        if let Err(e) = run_udp_relay(sock, table, psk, iface, block_private, init_cooldown).await {
             eprintln!("[QUIC UDP] {e}");
         }
     });
@@ -245,9 +249,11 @@ fn is_safe_v4(v4: Ipv4Addr) -> bool {
 }
 
 /// Returns false for addresses that should never be proxy targets (SSRF guard).
-/// `allow_private` is read once at startup and passed in (C-4).
-fn is_safe_target(addr: &SocketAddr, allow_private: bool) -> bool {
-    if allow_private {
+/// `block_private` is read once at startup and passed in (C-4).
+/// When false (the default), all targets are allowed — snell is a proxy tool
+/// and LAN forwarding is a legitimate use case.
+fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
+    if !block_private {
         return true;
     }
     let ip = addr.ip();
@@ -275,7 +281,7 @@ async fn run_udp_relay(
     table: SessionTable,
     psk: Arc<Vec<u8>>,
     iface: Option<Arc<String>>,
-    allow_private: bool,
+    block_private: bool,
     init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
@@ -359,7 +365,7 @@ async fn run_udp_relay(
                         Some(a) => a,
                         None => continue,
                     };
-                if !is_safe_target(&target_addr, allow_private) {
+                if !is_safe_target(&target_addr, block_private) {
                     eprintln!("[QUIC SSRF] blocked {target_addr}");
                     continue;
                 }
@@ -422,7 +428,7 @@ async fn dispatch(
     psk: &[u8],
     tls: &TlsAcceptor,
     iface: Option<&str>,
-    allow_private: bool,
+    block_private: bool,
 ) -> Result<()> {
     // Bound only the obfs handshake (peek + optional HTTP/TLS upgrade).
     // The relay loop inside handle() must not be bounded.
@@ -438,7 +444,7 @@ async fn dispatch(
             let stream = tokio::time::timeout(handshake_deadline, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
-            handle(stream, psk, iface, allow_private).await
+            handle(stream, psk, iface, block_private).await
         }
         b'G' => {
             tokio::time::timeout(handshake_deadline, absorb_http_request(&mut conn))
@@ -450,9 +456,9 @@ async fn dispatch(
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, allow_private).await
+            handle(conn, psk, iface, block_private).await
         }
-        _ => handle(conn, psk, iface, allow_private).await,
+        _ => handle(conn, psk, iface, block_private).await,
     }
 }
 
@@ -486,7 +492,7 @@ async fn absorb_http_request(conn: &mut TcpStream) -> Result<()> {
     }
 }
 
-async fn handle<S>(mut conn: S, psk: &[u8], iface: Option<&str>, allow_private: bool) -> Result<()>
+async fn handle<S>(mut conn: S, psk: &[u8], iface: Option<&str>, block_private: bool) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -526,7 +532,7 @@ where
             .next()
             .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
 
-        if !is_safe_target(&target_addr, allow_private) {
+        if !is_safe_target(&target_addr, block_private) {
             eprintln!(
                 "[SSRF] blocked CONNECT → {}:{} (resolved to {})",
                 req.host, req.port, target_addr
@@ -600,180 +606,183 @@ mod tests {
     }
 
     #[test]
-    fn allow_private_flag_bypasses_all_checks() {
-        assert!(is_safe_target(&v4(127, 0, 0, 1), true));
-        assert!(is_safe_target(&v4(10, 0, 0, 1), true));
-        assert!(is_safe_target(&v4(0, 0, 0, 0), true));
-        assert!(is_safe_target(&v6("::1"), true));
-        assert!(is_safe_target(&v6("fc00::1"), true));
+    fn block_private_unset_allows_all_targets() {
+        // Default behavior: block_private=false → no SSRF guard, everything passes.
+        assert!(is_safe_target(&v4(127, 0, 0, 1), false));
+        assert!(is_safe_target(&v4(10, 0, 0, 1), false));
+        assert!(is_safe_target(&v4(0, 0, 0, 0), false));
+        assert!(is_safe_target(&v6("::1"), false));
+        assert!(is_safe_target(&v6("fc00::1"), false));
     }
+
+    // Remaining tests pass block_private=true to exercise the SSRF guard itself.
 
     #[test]
     fn rejects_ipv4_loopback() {
-        assert!(!is_safe_target(&v4(127, 0, 0, 1), false));
-        assert!(!is_safe_target(&v4(127, 255, 255, 254), false));
+        assert!(!is_safe_target(&v4(127, 0, 0, 1), true));
+        assert!(!is_safe_target(&v4(127, 255, 255, 254), true));
     }
 
     #[test]
     fn rejects_ipv6_loopback() {
-        assert!(!is_safe_target(&v6("::1"), false));
+        assert!(!is_safe_target(&v6("::1"), true));
     }
 
     #[test]
     fn rejects_ipv4_multicast() {
-        assert!(!is_safe_target(&v4(224, 0, 0, 1), false));
-        assert!(!is_safe_target(&v4(239, 255, 255, 255), false));
+        assert!(!is_safe_target(&v4(224, 0, 0, 1), true));
+        assert!(!is_safe_target(&v4(239, 255, 255, 255), true));
     }
 
     #[test]
     fn rejects_ipv6_multicast() {
-        assert!(!is_safe_target(&v6("ff00::1"), false));
-        assert!(!is_safe_target(&v6("ff02::1"), false));
+        assert!(!is_safe_target(&v6("ff00::1"), true));
+        assert!(!is_safe_target(&v6("ff02::1"), true));
     }
 
     #[test]
     fn rejects_ipv4_unspecified() {
-        assert!(!is_safe_target(&v4(0, 0, 0, 0), false));
+        assert!(!is_safe_target(&v4(0, 0, 0, 0), true));
     }
 
     #[test]
     fn rejects_ipv6_unspecified() {
-        assert!(!is_safe_target(&v6("::"), false));
+        assert!(!is_safe_target(&v6("::"), true));
     }
 
     #[test]
     fn rejects_rfc1918_ten_dot() {
-        assert!(!is_safe_target(&v4(10, 0, 0, 1), false));
-        assert!(!is_safe_target(&v4(10, 255, 255, 255), false));
+        assert!(!is_safe_target(&v4(10, 0, 0, 1), true));
+        assert!(!is_safe_target(&v4(10, 255, 255, 255), true));
     }
 
     #[test]
     fn rejects_rfc1918_172_16_through_172_31() {
-        assert!(!is_safe_target(&v4(172, 16, 0, 0), false));
-        assert!(!is_safe_target(&v4(172, 31, 255, 255), false));
+        assert!(!is_safe_target(&v4(172, 16, 0, 0), true));
+        assert!(!is_safe_target(&v4(172, 31, 255, 255), true));
     }
 
     #[test]
     fn accepts_172_just_below_rfc1918_range() {
         // 172.15.x.x is public, not RFC 1918.
-        assert!(is_safe_target(&v4(172, 15, 0, 1), false));
+        assert!(is_safe_target(&v4(172, 15, 0, 1), true));
     }
 
     #[test]
     fn accepts_172_just_above_rfc1918_range() {
         // 172.32.x.x is public, not RFC 1918.
-        assert!(is_safe_target(&v4(172, 32, 0, 1), false));
+        assert!(is_safe_target(&v4(172, 32, 0, 1), true));
     }
 
     #[test]
     fn rejects_rfc1918_192_168() {
-        assert!(!is_safe_target(&v4(192, 168, 0, 1), false));
-        assert!(!is_safe_target(&v4(192, 168, 255, 255), false));
+        assert!(!is_safe_target(&v4(192, 168, 0, 1), true));
+        assert!(!is_safe_target(&v4(192, 168, 255, 255), true));
     }
 
     #[test]
     fn rejects_ipv4_link_local() {
-        assert!(!is_safe_target(&v4(169, 254, 0, 1), false));
-        assert!(!is_safe_target(&v4(169, 254, 255, 254), false));
+        assert!(!is_safe_target(&v4(169, 254, 0, 1), true));
+        assert!(!is_safe_target(&v4(169, 254, 255, 254), true));
     }
 
     #[test]
     fn rejects_ipv4_broadcast() {
-        assert!(!is_safe_target(&v4(255, 255, 255, 255), false));
+        assert!(!is_safe_target(&v4(255, 255, 255, 255), true));
     }
 
     #[test]
     fn rejects_this_host_zero_slash_eight() {
         // 0.0.0.0/8 — "this host on this network" (RFC 1122).
-        assert!(!is_safe_target(&v4(0, 1, 2, 3), false));
-        assert!(!is_safe_target(&v4(0, 255, 255, 255), false));
+        assert!(!is_safe_target(&v4(0, 1, 2, 3), true));
+        assert!(!is_safe_target(&v4(0, 255, 255, 255), true));
     }
 
     #[test]
     fn rejects_cgnat_lower_bound() {
         // 100.64.0.0/10 — CGNAT (RFC 6598).
-        assert!(!is_safe_target(&v4(100, 64, 0, 0), false));
+        assert!(!is_safe_target(&v4(100, 64, 0, 0), true));
     }
 
     #[test]
     fn rejects_ietf_protocol_assignments_192_0_0() {
         // 192.0.0.0/24 — IETF Protocol Assignments (RFC 6890).
-        assert!(!is_safe_target(&v4(192, 0, 0, 0), false));
-        assert!(!is_safe_target(&v4(192, 0, 0, 255), false));
+        assert!(!is_safe_target(&v4(192, 0, 0, 0), true));
+        assert!(!is_safe_target(&v4(192, 0, 0, 255), true));
     }
 
     #[test]
     fn accepts_just_outside_ietf_assignments_range() {
         // 192.0.1.0 is just outside /24, must pass.
-        assert!(is_safe_target(&v4(192, 0, 1, 0), false));
+        assert!(is_safe_target(&v4(192, 0, 1, 0), true));
         // 191.255.255.255 just below, must pass.
-        assert!(is_safe_target(&v4(191, 255, 255, 255), false));
+        assert!(is_safe_target(&v4(191, 255, 255, 255), true));
     }
 
     #[test]
     fn rejects_cgnat_upper_bound() {
-        assert!(!is_safe_target(&v4(100, 127, 255, 255), false));
+        assert!(!is_safe_target(&v4(100, 127, 255, 255), true));
     }
 
     #[test]
     fn accepts_just_below_cgnat_range() {
-        assert!(is_safe_target(&v4(100, 63, 255, 255), false));
+        assert!(is_safe_target(&v4(100, 63, 255, 255), true));
     }
 
     #[test]
     fn accepts_just_above_cgnat_range() {
-        assert!(is_safe_target(&v4(100, 128, 0, 0), false));
+        assert!(is_safe_target(&v4(100, 128, 0, 0), true));
     }
 
     #[test]
     fn rejects_ipv6_unique_local_fc00() {
-        assert!(!is_safe_target(&v6("fc00::1"), false));
+        assert!(!is_safe_target(&v6("fc00::1"), true));
     }
 
     #[test]
     fn rejects_ipv6_unique_local_fd00() {
         // fd00::/8 falls inside fc00::/7.
-        assert!(!is_safe_target(&v6("fd12:3456:789a::1"), false));
+        assert!(!is_safe_target(&v6("fd12:3456:789a::1"), true));
     }
 
     #[test]
     fn rejects_ipv6_link_local_fe80() {
-        assert!(!is_safe_target(&v6("fe80::1"), false));
-        assert!(!is_safe_target(&v6("febf:ffff::1"), false));
+        assert!(!is_safe_target(&v6("fe80::1"), true));
+        assert!(!is_safe_target(&v6("febf:ffff::1"), true));
     }
 
     #[test]
     fn rejects_ipv4_mapped_loopback() {
         // C-1: ::ffff:127.0.0.1 must unwrap and re-apply IPv4 rules.
-        assert!(!is_safe_target(&v6("::ffff:127.0.0.1"), false));
+        assert!(!is_safe_target(&v6("::ffff:127.0.0.1"), true));
     }
 
     #[test]
     fn rejects_ipv4_mapped_private() {
-        assert!(!is_safe_target(&v6("::ffff:192.168.1.1"), false));
-        assert!(!is_safe_target(&v6("::ffff:10.0.0.1"), false));
+        assert!(!is_safe_target(&v6("::ffff:192.168.1.1"), true));
+        assert!(!is_safe_target(&v6("::ffff:10.0.0.1"), true));
     }
 
     #[test]
     fn rejects_ipv4_mapped_cgnat() {
-        assert!(!is_safe_target(&v6("::ffff:100.64.0.1"), false));
+        assert!(!is_safe_target(&v6("::ffff:100.64.0.1"), true));
     }
 
     #[test]
     fn accepts_ipv4_mapped_public() {
         // C-1: ::ffff:8.8.8.8 must unwrap to a public IPv4 and pass.
-        assert!(is_safe_target(&v6("::ffff:8.8.8.8"), false));
+        assert!(is_safe_target(&v6("::ffff:8.8.8.8"), true));
     }
 
     #[test]
     fn accepts_public_ipv4() {
-        assert!(is_safe_target(&v4(8, 8, 8, 8), false));
-        assert!(is_safe_target(&v4(1, 1, 1, 1), false));
+        assert!(is_safe_target(&v4(8, 8, 8, 8), true));
+        assert!(is_safe_target(&v4(1, 1, 1, 1), true));
     }
 
     #[test]
     fn accepts_public_ipv6() {
-        assert!(is_safe_target(&v6("2606:4700:4700::1111"), false));
-        assert!(is_safe_target(&v6("2001:4860:4860::8888"), false));
+        assert!(is_safe_target(&v6("2606:4700:4700::1111"), true));
+        assert!(is_safe_target(&v6("2001:4860:4860::8888"), true));
     }
 }
