@@ -18,6 +18,7 @@ use anyhow::{Result, bail};
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::quic::{SessionTable, UdpSession, gc_sessions, new_session_table};
 use snell::relay::copy_t2c_adaptive;
+use snell::salt_cache::SaltCache;
 use snell::snell::{
     CMD_CONNECT, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL, parse_request,
     read_chunk,
@@ -110,6 +111,9 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // CVE-3: Salt replay protection — shared across TCP and QUIC paths.
+    let salt_cache = SaltCache::new();
+
     let activation_fds_i32: Vec<i32> = activation_fds.iter().map(|&fd| fd.into()).collect();
 
     // systemd socket activation: adopt pre-bound FDs if present.
@@ -130,6 +134,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                     egress_iface.clone(),
                     block_private,
                     init_cooldown.clone(),
+                    salt_cache.clone(),
                 );
             }
             tcp_ln
@@ -149,6 +154,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 egress_iface.clone(),
                 block_private,
                 init_cooldown.clone(),
+                salt_cache.clone(),
             );
         }
         ln
@@ -188,6 +194,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         let psk = psk.clone();
         let tls_acceptor = tls_acceptor.clone();
         let iface = egress_iface.clone();
+        let salt_cache_per_conn = salt_cache.clone();
         tokio::spawn(async move {
             let _permit = permit; // released on drop
             if let Err(e) = dispatch(
@@ -196,6 +203,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 &tls_acceptor,
                 iface.as_deref().map(String::as_str),
                 block_private,
+                &salt_cache_per_conn,
             )
             .await
             {
@@ -224,10 +232,13 @@ fn spawn_udp_listener(
     iface: Option<Arc<String>>,
     block_private: bool,
     init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    salt_cache: SaltCache,
 ) {
     let sock = Arc::new(sock);
     tokio::spawn(async move {
-        if let Err(e) = run_udp_relay(sock, table, psk, iface, block_private, init_cooldown).await {
+        if let Err(e) =
+            run_udp_relay(sock, table, psk, iface, block_private, init_cooldown, salt_cache).await
+        {
             eprintln!("[QUIC UDP] {e}");
         }
     });
@@ -283,6 +294,7 @@ async fn run_udp_relay(
     iface: Option<Arc<String>>,
     block_private: bool,
     init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    salt_cache: SaltCache,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
@@ -346,6 +358,13 @@ async fn run_udp_relay(
 
                 // SAFETY: length guarded by the `< 16 + HDR_CT_LEN + 16` check above.
                 let salt: [u8; 16] = buf[..16].try_into().expect("guarded above");
+
+                // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
+                if !salt_cache.check_and_insert(&salt) {
+                    eprintln!("[QUIC] salt replay detected from {src}, dropping");
+                    continue;
+                }
+
                 let req = match snell::quic::decrypt_init(&psk, &salt, &buf[16..n]) {
                     Ok(r) => r,
                     Err(e) => {
@@ -429,6 +448,7 @@ async fn dispatch(
     tls: &TlsAcceptor,
     iface: Option<&str>,
     block_private: bool,
+    salt_cache: &SaltCache,
 ) -> Result<()> {
     // Bound only the obfs handshake (peek + optional HTTP/TLS upgrade).
     // The relay loop inside handle() must not be bounded.
@@ -444,7 +464,7 @@ async fn dispatch(
             let stream = tokio::time::timeout(handshake_deadline, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
-            handle(stream, psk, iface, block_private).await
+            handle(stream, psk, iface, block_private, salt_cache).await
         }
         b'G' => {
             tokio::time::timeout(handshake_deadline, absorb_http_request(&mut conn))
@@ -456,9 +476,9 @@ async fn dispatch(
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, block_private).await
+            handle(conn, psk, iface, block_private, salt_cache).await
         }
-        _ => handle(conn, psk, iface, block_private).await,
+        _ => handle(conn, psk, iface, block_private, salt_cache).await,
     }
 }
 
@@ -492,7 +512,13 @@ async fn absorb_http_request(conn: &mut TcpStream) -> Result<()> {
     }
 }
 
-async fn handle<S>(mut conn: S, psk: &[u8], iface: Option<&str>, block_private: bool) -> Result<()>
+async fn handle<S>(
+    mut conn: S,
+    psk: &[u8],
+    iface: Option<&str>,
+    block_private: bool,
+    salt_cache: &SaltCache,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -504,6 +530,12 @@ where
     )
     .await
     .map_err(|_| anyhow::anyhow!("salt-exchange timeout"))??;
+
+    // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
+    if !salt_cache.check_and_insert(&client_salt) {
+        bail!("salt replay detected");
+    }
+
     let mut c2s = SnellCipher::new(psk, &client_salt)?;
 
     let (server_salt, mut s2c) = SnellCipher::with_random_salt(psk)?;
