@@ -40,6 +40,14 @@ fn build_handshake(psk: &[u8], host: &str, target_port: u16) -> (Vec<u8>, [u8; S
     for b in salt.iter_mut() {
         *b = rand::random();
     }
+    // dispatch() peeks the first byte and routes 0x16 → TLS obfs, 'G' (0x47) →
+    // HTTP obfs, anything else → plain Snell. A random salt has a ~0.78%
+    // chance of colliding with one of those prefixes, in which case the
+    // server never reaches the salt-cache check and this test times out.
+    // Re-roll until the leading byte routes to the plain Snell path.
+    while salt[0] == 0x16 || salt[0] == b'G' {
+        salt[0] = rand::random();
+    }
     let mut cipher = SnellCipher::new(psk, &salt).unwrap();
 
     // [ver=0x01][cmd=CONNECT_V2=0x05][client_id_len=0][host_len][host][port_be]
