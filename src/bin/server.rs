@@ -331,123 +331,146 @@ async fn run_udp_relay(
                 let _ = session.target_sock.send(&buf[..n]).await;
             }
             (snell::quic::PacketKind::Init, _) => {
-                if n < 16 + snell::cipher::HDR_CT_LEN + 16 {
-                    eprintln!("[QUIC] init too short from {src}");
-                    continue;
-                }
-
-                // C-3: Per-IP rate limit to throttle argon2id work.
-                {
-                    let now = std::time::Instant::now();
-                    let mut cool = init_cooldown.lock().await;
-                    if let Some(&last) = cool.get(&src.ip())
-                        && now.duration_since(last).as_millis() < INIT_COOLDOWN_MS
-                    {
-                        eprintln!("[QUIC] init rate-limited from {src}");
-                        continue;
-                    }
-                    cool.insert(src.ip(), now);
-                    // GC stale entries to bound map growth.
-                    if cool.len() > 10_000 {
-                        let cutoff = now
-                            .checked_sub(std::time::Duration::from_secs(60))
-                            .unwrap_or(now);
-                        cool.retain(|_, t| *t >= cutoff);
-                    }
-                }
-
-                // C-3: Cap on total concurrent sessions.
-                {
-                    if table.read().await.len() >= MAX_UDP_SESSIONS {
-                        eprintln!("[QUIC] session table full, dropping init from {src}");
-                        continue;
-                    }
-                }
-
-                // SAFETY: length guarded by the `< 16 + HDR_CT_LEN + 16` check above.
-                let salt: [u8; 16] = buf[..16].try_into().expect("guarded above");
-
-                // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
-                if !salt_cache.check_and_insert(&salt) {
-                    eprintln!("[QUIC] salt replay detected from {src}, dropping");
-                    continue;
-                }
-
-                let req = match snell::quic::decrypt_init(&psk, &salt, &buf[16..n]) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("[QUIC] decrypt fail from {src}: {e}");
-                        continue;
-                    }
-                };
-                eprintln!("[QUIC] CONNECT_UDP from {src} -> {}:{}", req.host, req.port);
-
-                // Resolve and SSRF-check
-                let target_addr: SocketAddr =
-                    match tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
-                        .await
-                        .ok()
-                        .and_then(|mut it| it.next())
-                    {
-                        Some(a) => a,
-                        None => continue,
-                    };
-                if !is_safe_target(&target_addr, block_private) {
-                    eprintln!("[QUIC SSRF] blocked {target_addr}");
-                    continue;
-                }
-
-                // Bind outbound UDP socket (with optional egress interface)
-                let target_sock = match snell::egress::bind_udp(
-                    "0.0.0.0:0".parse().expect("static"),
+                handle_quic_init(
+                    &buf[..n],
+                    src,
+                    &sock,
+                    &table,
+                    &psk,
                     iface.as_deref().map(String::as_str),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[QUIC] bind: {e}");
-                        continue;
-                    }
-                };
-                if let Err(e) = target_sock.connect(target_addr).await {
-                    eprintln!("[QUIC] connect: {e}");
-                    continue;
-                }
-                let target_sock = Arc::new(target_sock);
-
-                // If trailing data exists in init payload, forward it to target now.
-                if !req.trailing.is_empty() {
-                    let _ = target_sock.send(&req.trailing).await;
-                }
-
-                let session = Arc::new(UdpSession {
-                    client_addr: src,
-                    target_sock: target_sock.clone(),
-                    last_seen: AtomicU64::new(0),
-                });
-                session.touch();
-                // H-6: Init path uses write lock.
-                table.write().await.insert(src, session.clone());
-
-                // Spawn target -> client forwarding task.
-                // H-1: Remove the session from the table when the relay exits.
-                let sock_back = sock.clone();
-                let table_cleanup = table.clone();
-                tokio::spawn(async move {
-                    let mut rbuf = vec![0u8; 65535];
-                    while let Ok(m) = target_sock.recv(&mut rbuf).await {
-                        if m == 0 {
-                            break;
-                        }
-                        if sock_back.send_to(&rbuf[..m], src).await.is_err() {
-                            break;
-                        }
-                        session.touch();
-                    }
-                    table_cleanup.write().await.remove(&src);
-                });
+                    block_private,
+                    &init_cooldown,
+                    &salt_cache,
+                )
+                .await;
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_quic_init(
+    packet: &[u8],
+    src: SocketAddr,
+    sock: &Arc<tokio::net::UdpSocket>,
+    table: &SessionTable,
+    psk: &[u8],
+    iface: Option<&str>,
+    block_private: bool,
+    init_cooldown: &Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    salt_cache: &SaltCache,
+) {
+    let n = packet.len();
+
+    if n < 16 + snell::cipher::HDR_CT_LEN + 16 {
+        eprintln!("[QUIC] init too short from {src}");
+        return;
+    }
+
+    // C-3: Per-IP rate limit to throttle argon2id work.
+    {
+        let now = std::time::Instant::now();
+        let mut cool = init_cooldown.lock().await;
+        if let Some(&last) = cool.get(&src.ip())
+            && now.duration_since(last).as_millis() < INIT_COOLDOWN_MS
+        {
+            eprintln!("[QUIC] init rate-limited from {src}");
+            return;
+        }
+        cool.insert(src.ip(), now);
+        // GC stale entries to bound map growth.
+        if cool.len() > 10_000 {
+            let cutoff = now
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or(now);
+            cool.retain(|_, t| *t >= cutoff);
+        }
+    }
+
+    // C-3: Cap on total concurrent sessions.
+    if table.read().await.len() >= MAX_UDP_SESSIONS {
+        eprintln!("[QUIC] session table full, dropping init from {src}");
+        return;
+    }
+
+    // SAFETY: length guarded by the `< 16 + HDR_CT_LEN + 16` check above.
+    let salt: [u8; 16] = packet[..16].try_into().expect("guarded above");
+
+    // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
+    if !salt_cache.check_and_insert(&salt) {
+        eprintln!("[QUIC] salt replay detected from {src}, dropping");
+        return;
+    }
+
+    let req = match snell::quic::decrypt_init(psk, &salt, &packet[16..]) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[QUIC] decrypt fail from {src}: {e}");
+            return;
+        }
+    };
+    eprintln!("[QUIC] CONNECT_UDP from {src} -> {}:{}", req.host, req.port);
+
+    // Resolve and SSRF-check
+    let target_addr: SocketAddr =
+        match tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
+            .await
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            Some(a) => a,
+            None => return,
+        };
+    if !is_safe_target(&target_addr, block_private) {
+        eprintln!("[QUIC SSRF] blocked {target_addr}");
+        return;
+    }
+
+    // Bind outbound UDP socket (with optional egress interface)
+    let target_sock = match snell::egress::bind_udp("0.0.0.0:0".parse().expect("static"), iface) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[QUIC] bind: {e}");
+            return;
+        }
+    };
+    if let Err(e) = target_sock.connect(target_addr).await {
+        eprintln!("[QUIC] connect: {e}");
+        return;
+    }
+    let target_sock = Arc::new(target_sock);
+
+    // If trailing data exists in init payload, forward it to target now.
+    if !req.trailing.is_empty() {
+        let _ = target_sock.send(&req.trailing).await;
+    }
+
+    let session = Arc::new(UdpSession {
+        client_addr: src,
+        target_sock: target_sock.clone(),
+        last_seen: AtomicU64::new(0),
+    });
+    session.touch();
+    // H-6: Init path uses write lock.
+    table.write().await.insert(src, session.clone());
+
+    // Spawn target -> client forwarding task.
+    // H-1: Remove the session from the table when the relay exits.
+    let sock_back = sock.clone();
+    let table_cleanup = table.clone();
+    tokio::spawn(async move {
+        let mut rbuf = vec![0u8; 65535];
+        while let Ok(m) = target_sock.recv(&mut rbuf).await {
+            if m == 0 {
+                break;
+            }
+            if sock_back.send_to(&rbuf[..m], src).await.is_err() {
+                break;
+            }
+            session.touch();
+        }
+        table_cleanup.write().await.remove(&src);
+    });
 }
 
 async fn dispatch(
