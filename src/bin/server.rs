@@ -8,6 +8,10 @@
 //!   QUIC=1                Enable QUIC proxy mode (opens UDP on same port)
 //!   BLOCK_PRIVATE_TARGETS=1  Refuse to proxy to loopback/private/reserved addresses
 //!                            (default: allow — proxying to LAN is a legit use case)
+//!   TCP_FASTOPEN=0        Disable server-side TCP Fast Open (default: on, matches
+//!                         official snell-server). The effective state still needs
+//!                         the kernel sysctl (Linux net.ipv4.tcp_fastopen bit 2;
+//!                         macOS net.inet.tcp.fastopen bit 2).
 //!
 //! Obfuscation auto-detected from first byte:
 //!   plain    — random Snell salt
@@ -102,6 +106,13 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let block_private = std::env::var("BLOCK_PRIVATE_TARGETS")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // TCP_FASTOPEN defaults to on (matches official snell-server).
+    // Explicitly set TCP_FASTOPEN=0 to disable. Anything else (including unset
+    // or "1") leaves it enabled. The effective state still requires the kernel
+    // sysctl to permit server-side TFO.
+    let tfo_listen = std::env::var("TCP_FASTOPEN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
     let session_table = new_session_table();
@@ -160,6 +171,12 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         ln
     };
 
+    let tfo_active = if tfo_listen {
+        apply_listen_tfo(&tcp_ln)
+    } else {
+        false
+    };
+
     eprintln!(
         "snell-server v5 listening on {listen}  \
          (plain / obfs=http / obfs=tls{}{})",
@@ -169,6 +186,9 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
             .map(|i| format!(" / egress={i}"))
             .unwrap_or_default(),
     );
+    if tfo_active {
+        eprintln!("<NOTIFY> TCP Fast Open enabled");
+    }
 
     // GC idle QUIC sessions every 30 s.
     if quic_enabled {
@@ -223,6 +243,30 @@ fn make_tls_acceptor() -> Result<TlsAcceptor> {
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Best-effort `TCP_FASTOPEN` setsockopt on the listening socket.
+/// Returns true when the option was successfully applied. Failures are logged
+/// and swallowed — the listener still works without TFO when the kernel sysctl
+/// doesn't permit server-side cookies.
+fn apply_listen_tfo(_ln: &TcpListener) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        match snell::tfo::enable_listen_tfo(_ln.as_raw_fd()) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "snell-server: TCP Fast Open setsockopt failed ({e}); continuing without TFO"
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn spawn_udp_listener(
