@@ -74,6 +74,12 @@ pub fn spawn_server_with_envs(
     let mut cmd = Command::new(bin);
     cmd.arg(format!("0.0.0.0:{listen_port}"))
         .env("PSK", PSK)
+        // H-7: Disable the TCP per-IP handshake cooldown for tests. wait_tcp
+        // and the real test connection both originate from 127.0.0.1 within
+        // milliseconds of each other and would otherwise trip the 100 ms
+        // production default. Tests that want to verify the rate limiter pass
+        // an override in `extra_env` — Command::env is last-write-wins.
+        .env("TCP_HANDSHAKE_COOLDOWN_MS", "0")
         .kill_on_drop(true);
     // Note: as of v5.2.0 the SSRF guard is off by default, so we no longer need
     // to set BLOCK_PRIVATE_TARGETS=0 — proxying to 127.0.0.1 just works.
