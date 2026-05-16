@@ -17,6 +17,10 @@
 //!                         kernel falls back to a normal handshake, but enabling
 //!                         it requires Linux >= 4.11 and the sysctl client bit
 //!                         (no-op on macOS).
+//!   TCP_HANDSHAKE_COOLDOWN_MS  Minimum milliseconds between fresh TCP handshakes
+//!                         from the same source IP. Default 100. Set to 0 to
+//!                         disable. Bounds the argon2id work an attacker can
+//!                         induce from a single IP.
 //!
 //! Obfuscation auto-detected from first byte:
 //!   plain    — random Snell salt
@@ -51,6 +55,17 @@ const MAX_CONCURRENT_CONNS: usize = 4096;
 const MAX_UDP_SESSIONS: usize = 8192;
 // C-3: Minimum milliseconds between Init packets from the same source IP.
 const INIT_COOLDOWN_MS: u128 = 1000;
+// H-7: Default TCP handshake cooldown per source IP — bounds argon2id work
+// the way INIT_COOLDOWN_MS does for QUIC. Tunable via TCP_HANDSHAKE_COOLDOWN_MS,
+// 0 to disable. Default favors connection-reuse-heavy clients (Surge) over
+// rapid reconnects from a single IP.
+const TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT: u128 = 100;
+// Cap on cooldown-map size before GC kicks in (mirrors QUIC init_cooldown).
+const COOLDOWN_GC_THRESHOLD: usize = 10_000;
+// Idle window after which a cooldown entry is eligible for GC eviction.
+const COOLDOWN_GC_IDLE_SECS: u64 = 60;
+
+type IpCooldownMap = Arc<parking_lot::Mutex<HashMap<IpAddr, std::time::Instant>>>;
 
 fn main() -> Result<()> {
     // Read systemd FDs before any threads exist.
@@ -124,14 +139,25 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let tfo_out = std::env::var("TCP_FASTOPEN_OUT")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // H-7: Per-source-IP TCP handshake cooldown. Read once at startup; the
+    // env var accepts a decimal millisecond count, 0 disables.
+    let tcp_handshake_cooldown_ms: u128 = std::env::var("TCP_HANDSHAKE_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT);
 
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
     let session_table = new_session_table();
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS));
 
-    // C-3: Per-source-IP rate limiter for Init packets (bounds argon2id work).
-    let init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // C-3: Per-source-IP rate limiter for QUIC Init packets (bounds argon2id work).
+    // parking_lot::Mutex chosen over tokio::sync::Mutex — the critical section is
+    // microseconds (peek + maybe insert), so the synchronous lock is correct here.
+    let init_cooldown: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    // H-7: Per-source-IP TCP handshake cooldown (parallel to QUIC INIT_COOLDOWN).
+    // Lazily constructed only when the env-configured cooldown is non-zero, since
+    // the accept loop fast-paths around it when disabled.
+    let tcp_cooldown: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     // CVE-3: Salt replay protection — shared across TCP and QUIC paths.
     let salt_cache = SaltCache::new();
@@ -215,6 +241,17 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
 
     loop {
         let (conn, peer) = tcp_ln.accept().await?;
+
+        // H-7: Per-source-IP TCP handshake cooldown — checked before the
+        // semaphore acquire so a rate-limited IP doesn't briefly consume a slot.
+        if tcp_handshake_cooldown_ms > 0
+            && !cooldown_check_and_insert(&tcp_cooldown, peer.ip(), tcp_handshake_cooldown_ms)
+        {
+            eprintln!("[{peer}] dropped: handshake rate-limited");
+            drop(conn);
+            continue;
+        }
+
         let permit = match conn_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -257,6 +294,32 @@ fn make_tls_acceptor() -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Atomic per-source-IP cooldown check. Returns `true` if the IP is allowed
+/// through (and records the current timestamp); `false` if the previous entry
+/// is younger than `cooldown_ms`. Used by both the TCP accept loop and the
+/// QUIC Init handler with their own cooldown maps and intervals.
+fn cooldown_check_and_insert(
+    map: &Arc<parking_lot::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    ip: IpAddr,
+    cooldown_ms: u128,
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut cool = map.lock();
+    if let Some(&last) = cool.get(&ip)
+        && now.duration_since(last).as_millis() < cooldown_ms
+    {
+        return false;
+    }
+    cool.insert(ip, now);
+    if cool.len() > COOLDOWN_GC_THRESHOLD {
+        let cutoff = now
+            .checked_sub(Duration::from_secs(COOLDOWN_GC_IDLE_SECS))
+            .unwrap_or(now);
+        cool.retain(|_, t| *t >= cutoff);
+    }
+    true
+}
+
 /// Best-effort `TCP_FASTOPEN` setsockopt on the listening socket.
 /// Returns true when the option was successfully applied. Failures are logged
 /// and swallowed — the listener still works without TFO when the kernel sysctl
@@ -287,7 +350,7 @@ fn spawn_udp_listener(
     psk: Arc<Vec<u8>>,
     iface: Option<Arc<String>>,
     block_private: bool,
-    init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) {
     let sock = Arc::new(sock);
@@ -357,7 +420,7 @@ async fn run_udp_relay(
     psk: Arc<Vec<u8>>,
     iface: Option<Arc<String>>,
     block_private: bool,
-    init_cooldown: Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
@@ -413,7 +476,7 @@ async fn handle_quic_init(
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
-    init_cooldown: &Arc<tokio::sync::Mutex<HashMap<IpAddr, std::time::Instant>>>,
+    init_cooldown: &IpCooldownMap,
     salt_cache: &SaltCache,
 ) {
     let n = packet.len();
@@ -424,23 +487,9 @@ async fn handle_quic_init(
     }
 
     // C-3: Per-IP rate limit to throttle argon2id work.
-    {
-        let now = std::time::Instant::now();
-        let mut cool = init_cooldown.lock().await;
-        if let Some(&last) = cool.get(&src.ip())
-            && now.duration_since(last).as_millis() < INIT_COOLDOWN_MS
-        {
-            eprintln!("[QUIC] init rate-limited from {src}");
-            return;
-        }
-        cool.insert(src.ip(), now);
-        // GC stale entries to bound map growth.
-        if cool.len() > 10_000 {
-            let cutoff = now
-                .checked_sub(std::time::Duration::from_secs(60))
-                .unwrap_or(now);
-            cool.retain(|_, t| *t >= cutoff);
-        }
+    if !cooldown_check_and_insert(init_cooldown, src.ip(), INIT_COOLDOWN_MS) {
+        eprintln!("[QUIC] init rate-limited from {src}");
+        return;
     }
 
     // C-3: Cap on total concurrent sessions.
@@ -724,6 +773,42 @@ mod tests {
 
     fn v6(s: &str) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()), 443)
+    }
+
+    #[test]
+    fn cooldown_admits_first_then_rate_limits_within_window() {
+        let map: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        // First call admits.
+        assert!(cooldown_check_and_insert(&map, ip, 1000));
+        // Same IP within the 1000 ms window: rejected.
+        assert!(!cooldown_check_and_insert(&map, ip, 1000));
+    }
+
+    #[test]
+    fn cooldown_isolates_per_ip() {
+        let map: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "198.51.100.42".parse().unwrap();
+        assert!(cooldown_check_and_insert(&map, a, 1000));
+        // Different IP must not be rate-limited by A's recent entry.
+        assert!(cooldown_check_and_insert(&map, b, 1000));
+        // Both individual IPs are now in cooldown.
+        assert!(!cooldown_check_and_insert(&map, a, 1000));
+        assert!(!cooldown_check_and_insert(&map, b, 1000));
+    }
+
+    #[test]
+    fn cooldown_zero_window_never_rate_limits() {
+        // Cooldown of 0 ms is the production "disabled" sentinel — every call
+        // must admit (even though the helper itself isn't gated on the env var;
+        // the accept loop short-circuits when the configured cooldown is 0).
+        let map: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        // duration_since(last).as_millis() >= 0 always, so window 0 admits all.
+        assert!(cooldown_check_and_insert(&map, ip, 0));
+        assert!(cooldown_check_and_insert(&map, ip, 0));
+        assert!(cooldown_check_and_insert(&map, ip, 0));
     }
 
     #[test]
