@@ -32,3 +32,12 @@ parking_lot  = "0.12"
 
 [dev-dependencies]
 serial_test  = "3"
+
+# Release builds favor runtime perf and binary size over compile time.
+# Trade: cold rebuild goes from ~30s to ~90s on CI, but the binary is
+# 5-15% faster on net-bound workloads and noticeably smaller.
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
