@@ -67,6 +67,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | `QUIC` | — | `0` | Set to `1` to enable QUIC proxy mode |
 | `TCP_FASTOPEN` | — | `1` | Server-side TFO. Set to `0` to disable. See [TCP Fast Open](#tcp-fast-open) |
 | `TCP_FASTOPEN_OUT` | — | `0` | Set to `1` to opt outbound CONNECT sockets into client-side TFO |
+| `TCP_HANDSHAKE_COOLDOWN_MS` | — | `100` | Per-source-IP minimum ms between fresh TCP handshakes. Bounds argon2id DoS from a single IP. `0` disables |
 
 ```bash
 PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
