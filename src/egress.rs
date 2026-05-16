@@ -8,27 +8,38 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use tokio::net::{TcpStream, UdpSocket};
 
-/// Connect to `addr`, optionally binding the socket to `iface` first.
-pub async fn connect_tcp(addr: SocketAddr, iface: Option<&str>) -> Result<TcpStream> {
-    if let Some(iface) = iface {
-        let sock = if addr.is_ipv6() {
-            tokio::net::TcpSocket::new_v6()
-        } else {
-            tokio::net::TcpSocket::new_v4()
-        }
-        .context("create TCP socket")?;
+/// Connect to `addr`, optionally binding the socket to `iface` and/or opting
+/// the socket into client-side TCP Fast Open before connecting.
+pub async fn connect_tcp(addr: SocketAddr, iface: Option<&str>, tfo: bool) -> Result<TcpStream> {
+    if iface.is_none() && !tfo {
+        return TcpStream::connect(addr).await.context("connect");
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
+    let sock = if addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()
+    } else {
+        tokio::net::TcpSocket::new_v4()
+    }
+    .context("create TCP socket")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Some(iface) = iface {
             bind_to_iface(sock.as_raw_fd(), iface, addr.is_ipv6())
                 .with_context(|| format!("bind to interface {iface}"))?;
         }
-
-        sock.connect(addr).await.context("connect")
-    } else {
-        TcpStream::connect(addr).await.context("connect")
+        if tfo && let Err(e) = crate::tfo::enable_connect_tfo(sock.as_raw_fd()) {
+            // Best-effort: log and continue without TFO if the kernel rejects it.
+            eprintln!("TCP Fast Open connect setsockopt failed ({e}); continuing without TFO");
+        }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = tfo;
+    }
+
+    sock.connect(addr).await.context("connect")
 }
 
 /// Bind a UDP socket to `local`, optionally locking it to `iface`.

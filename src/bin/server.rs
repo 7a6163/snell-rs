@@ -12,6 +12,11 @@
 //!                         official snell-server). The effective state still needs
 //!                         the kernel sysctl (Linux net.ipv4.tcp_fastopen bit 2;
 //!                         macOS net.inet.tcp.fastopen bit 2).
+//!   TCP_FASTOPEN_OUT=1    Opt outbound CONNECT sockets into TCP Fast Open.
+//!                         Off by default — many targets don't speak TFO and the
+//!                         kernel falls back to a normal handshake, but enabling
+//!                         it requires Linux >= 4.11 and the sysctl client bit
+//!                         (no-op on macOS).
 //!
 //! Obfuscation auto-detected from first byte:
 //!   plain    — random Snell salt
@@ -113,6 +118,12 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let tfo_listen = std::env::var("TCP_FASTOPEN")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // Outbound TFO is opt-in: many targets don't speak it, and although the
+    // kernel transparently falls back, the extra syscall costs nothing only
+    // when it actually buys us a half-RTT win on persistent destinations.
+    let tfo_out = std::env::var("TCP_FASTOPEN_OUT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
     let session_table = new_session_table();
@@ -223,6 +234,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 &tls_acceptor,
                 iface.as_deref().map(String::as_str),
                 block_private,
+                tfo_out,
                 &salt_cache_per_conn,
             )
             .await
@@ -523,6 +535,7 @@ async fn dispatch(
     tls: &TlsAcceptor,
     iface: Option<&str>,
     block_private: bool,
+    tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
     // Bound only the obfs handshake (peek + optional HTTP/TLS upgrade).
@@ -539,7 +552,7 @@ async fn dispatch(
             let stream = tokio::time::timeout(handshake_deadline, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
-            handle(stream, psk, iface, block_private, salt_cache).await
+            handle(stream, psk, iface, block_private, tfo_out, salt_cache).await
         }
         b'G' => {
             tokio::time::timeout(handshake_deadline, absorb_http_request(&mut conn))
@@ -551,9 +564,9 @@ async fn dispatch(
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, block_private, salt_cache).await
+            handle(conn, psk, iface, block_private, tfo_out, salt_cache).await
         }
-        _ => handle(conn, psk, iface, block_private, salt_cache).await,
+        _ => handle(conn, psk, iface, block_private, tfo_out, salt_cache).await,
     }
 }
 
@@ -592,6 +605,7 @@ async fn handle<S>(
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
+    tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()>
 where
@@ -650,7 +664,7 @@ where
             continue;
         }
 
-        let mut target = match snell::egress::connect_tcp(target_addr, iface).await {
+        let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[connect-fail] {}:{}: {e}", req.host, req.port); // server-side detail
