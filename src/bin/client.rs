@@ -61,6 +61,27 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Generate a 16-byte handshake salt whose first byte cannot collide with the
+/// server-side obfs auto-detect (`dispatch()` routes `0x16` → TLS, `'G'` →
+/// HTTP, anything else → plain). With a uniform random salt the collision rate
+/// is ~0.78% per connection; for connection-reuse-heavy clients the cumulative
+/// failure rate is non-trivial and surfaces as `UnknownProtocolVersion` errors
+/// on the server's TLS handler. Re-rolling the first byte is a no-op for the
+/// Snell protocol (the salt is opaque KDF input — uniform distribution is not
+/// required) and eliminates the flake without changing the wire format.
+fn fresh_handshake_salt(psk: &[u8]) -> Result<([u8; SALT_LEN], SnellCipher)> {
+    use rand::RngCore;
+    let mut salt = [0u8; SALT_LEN];
+    loop {
+        rand::thread_rng().fill_bytes(&mut salt);
+        if salt[0] != 0x16 && salt[0] != b'G' {
+            break;
+        }
+    }
+    let cipher = SnellCipher::new(psk, &salt)?;
+    Ok((salt, cipher))
+}
+
 /// Connect to the snell server, optionally opting into client-side TFO.
 async fn connect_server(server: SocketAddr, tfo_out: bool) -> anyhow::Result<TcpStream> {
     if !tfo_out {
@@ -141,7 +162,7 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
 
     // Connect to Snell server and perform handshake
     let mut remote = connect_server(server, tfo_out).await?;
-    let (salt, mut c2s) = SnellCipher::with_random_salt(psk)?;
+    let (salt, mut c2s) = fresh_handshake_salt(psk)?;
     remote.write_all(&salt).await?;
 
     // Snell v5 CONNECT_V2 request: [ver=1][cmd=5][client_id_len=0][host_len][host][port BE]
