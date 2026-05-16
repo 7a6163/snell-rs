@@ -27,7 +27,11 @@ use std::os::unix::io::RawFd;
 /// `setsockopt` itself fails — callers typically log and continue.
 #[cfg(target_os = "linux")]
 pub fn enable_listen_tfo(fd: RawFd) -> std::io::Result<()> {
-    // SAFETY: fd is a borrowed listening socket owned by the caller.
+    // SAFETY: fd is a valid open SOCK_STREAM file descriptor for the lifetime
+    // of this call (the caller owns it). The optval pointer references a
+    // 'static `c_int` (LINUX_TFO_QLEN), so the storage outlives the syscall.
+    // size_of_val(&LINUX_TFO_QLEN) matches the kernel's expected length for
+    // TCP_FASTOPEN (sizeof(int)).
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -49,7 +53,11 @@ pub fn enable_listen_tfo(fd: RawFd) -> std::io::Result<()> {
     // value documented in /usr/include/netinet/tcp.h.
     const MACOS_TCP_FASTOPEN: libc::c_int = 261;
     let on: libc::c_int = 1;
-    // SAFETY: fd is a borrowed listening socket owned by the caller.
+    // SAFETY: fd is a valid open SOCK_STREAM file descriptor for the lifetime
+    // of this call (the caller owns it). The optval pointer references the
+    // local `on` `c_int` whose stack storage outlives the syscall. The length
+    // (sizeof(int)) matches what the macOS kernel expects for TCP_FASTOPEN
+    // (boolean enable).
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -86,7 +94,11 @@ pub fn enable_connect_tfo(fd: RawFd) -> std::io::Result<()> {
     // the canonical Linux value (see include/uapi/linux/tcp.h).
     const TCP_FASTOPEN_CONNECT: libc::c_int = 30;
     let on: libc::c_int = 1;
-    // SAFETY: fd is a borrowed unconnected TCP socket owned by the caller.
+    // SAFETY: fd is a valid open SOCK_STREAM file descriptor that has not yet
+    // been connected (the caller owns it). The optval pointer references the
+    // local `on` `c_int` whose stack storage outlives the syscall. The length
+    // (sizeof(int)) matches the kernel's expected layout for the boolean
+    // TCP_FASTOPEN_CONNECT option.
     let ret = unsafe {
         libc::setsockopt(
             fd,

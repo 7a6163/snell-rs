@@ -29,6 +29,8 @@ pub async fn connect_tcp(addr: SocketAddr, iface: Option<&str>, tfo: bool) -> Re
             bind_to_iface(sock.as_raw_fd(), iface, addr.is_ipv6())
                 .with_context(|| format!("bind to interface {iface}"))?;
         }
+        // `if cond && let Pat = expr` chains stabilised in Rust 1.88; relies
+        // on the project's 1.95 toolchain pin (rust-toolchain.toml).
         if tfo && let Err(e) = crate::tfo::enable_connect_tfo(sock.as_raw_fd()) {
             // Best-effort: log and continue without TFO if the kernel rejects it.
             eprintln!("TCP Fast Open connect setsockopt failed ({e}); continuing without TFO");
@@ -129,4 +131,46 @@ fn bind_to_iface(fd: std::os::unix::io::RawFd, iface: &str, ipv6: bool) -> Resul
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn bind_to_iface(_fd: std::os::unix::io::RawFd, iface: &str, _ipv6: bool) -> Result<()> {
     anyhow::bail!("EGRESS_INTERFACE not supported on this platform (iface={iface})");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Exercises the `tfo=true` arm of connect_tcp end-to-end against a local
+    /// listener. The kernel may or may not actually arm TFO on the SYN
+    /// (depends on sysctl), but the setsockopt path executes and the connect
+    /// completes either way.
+    #[tokio::test]
+    async fn connect_tcp_with_tfo_succeeds() {
+        let ln = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = ln.local_addr().expect("local_addr");
+        let accept = tokio::spawn(async move {
+            let _ = ln.accept().await;
+        });
+
+        let stream = connect_tcp(addr, None, true)
+            .await
+            .expect("connect with tfo");
+        // Trigger the SYN by writing a byte (TCP_FASTOPEN_CONNECT defers it).
+        use tokio::io::AsyncWriteExt;
+        let mut s = stream;
+        let _ = s.write_all(b"x").await;
+        accept.await.expect("accept join");
+    }
+
+    /// Default path (tfo=false, iface=None) must keep using the
+    /// TcpStream::connect shortcut. Regression guard.
+    #[tokio::test]
+    async fn connect_tcp_default_path_still_works() {
+        let ln = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = ln.local_addr().expect("local_addr");
+        let accept = tokio::spawn(async move {
+            let _ = ln.accept().await;
+        });
+
+        connect_tcp(addr, None, false).await.expect("connect plain");
+        accept.await.expect("accept join");
+    }
 }
