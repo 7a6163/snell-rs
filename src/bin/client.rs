@@ -1,5 +1,9 @@
 //! snell-client — Snell v5 SOCKS5 proxy client.
 //! Usage: PSK=yourpsk SNELL_SERVER=host:port [LISTEN=127.0.0.1:1080] snell-client
+//!
+//! Optional env vars:
+//!   TCP_FASTOPEN=1  Opt the outbound socket to the snell server into
+//!                   client-side TFO (Linux >= 4.11 only; no-op on macOS).
 
 use anyhow::{Result, bail};
 use snell::cipher::{SALT_LEN, SnellCipher};
@@ -37,21 +41,47 @@ async fn main() -> Result<()> {
     let listen: SocketAddr = std::env::var("LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:1080".into())
         .parse()?;
+    let tfo_out = std::env::var("TCP_FASTOPEN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     let ln = TcpListener::bind(listen).await?;
     eprintln!("Snell v5 SOCKS5 proxy  {listen} → {server}");
+    if tfo_out {
+        eprintln!("<NOTIFY> TCP Fast Open enabled (outbound)");
+    }
     loop {
         let (conn, _) = ln.accept().await?;
         let psk = psk.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, server, &psk).await {
+            if let Err(e) = handle(conn, server, &psk, tfo_out).await {
                 eprintln!("error: {e}");
             }
         });
     }
 }
 
-async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8]) -> Result<()> {
+/// Connect to the snell server, optionally opting into client-side TFO.
+async fn connect_server(server: SocketAddr, tfo_out: bool) -> anyhow::Result<TcpStream> {
+    if !tfo_out {
+        return Ok(TcpStream::connect(server).await?);
+    }
+    let sock = if server.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()
+    } else {
+        tokio::net::TcpSocket::new_v4()
+    }?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) = snell::tfo::enable_connect_tfo(sock.as_raw_fd()) {
+            eprintln!("TCP Fast Open connect setsockopt failed ({e}); continuing without TFO");
+        }
+    }
+    Ok(sock.connect(server).await?)
+}
+
+async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: bool) -> Result<()> {
     // SOCKS5 greeting: VER(1) + NMETHODS(1) + METHODS(n)
     let mut greeting = [0u8; 2];
     local.read_exact(&mut greeting).await?;
@@ -110,7 +140,7 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8]) -> Result<
         .await?;
 
     // Connect to Snell server and perform handshake
-    let mut remote = TcpStream::connect(server).await?;
+    let mut remote = connect_server(server, tfo_out).await?;
     let (salt, mut c2s) = SnellCipher::with_random_salt(psk)?;
     remote.write_all(&salt).await?;
 

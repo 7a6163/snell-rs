@@ -85,6 +85,61 @@ async fn tcp_e2e_socks5_to_echo() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn tcp_e2e_with_tfo_envs() {
+    // Exercises both new TFO env paths:
+    //   server: TCP_FASTOPEN_OUT=1  -> egress::connect_tcp(_, _, true)
+    //   client: TCP_FASTOPEN=1      -> client::connect_server(_, true)
+    // setsockopt may or may not actually arm TFO depending on the kernel
+    // sysctl, but the code paths must execute and the proxy must still work.
+    let echo_port = spawn_echo().await;
+    let server_port = random_tcp_port();
+    let socks_port = random_tcp_port();
+
+    let _server = spawn_server_with_envs(server_port, false, &[("TCP_FASTOPEN_OUT", "1")]);
+    wait_tcp(server_port).await;
+    let _client = spawn_client_with_envs(server_port, socks_port, &[("TCP_FASTOPEN", "1")]);
+    wait_tcp(socks_port).await;
+
+    let mut stream = socks5_connect(socks_port, "127.0.0.1", echo_port).await;
+    stream.write_all(b"tfo-roundtrip").await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("timeout")
+        .expect("read");
+    assert!(
+        buf[..n]
+            .windows(b"tfo-roundtrip".len())
+            .any(|w| w == b"tfo-roundtrip")
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tcp_e2e_with_tfo_disabled() {
+    // Covers the TCP_FASTOPEN=0 disable branch — the server must skip the
+    // setsockopt call entirely and the proxy must still work.
+    let echo_port = spawn_echo().await;
+    let server_port = random_tcp_port();
+    let socks_port = random_tcp_port();
+
+    let _server = spawn_server_with_envs(server_port, false, &[("TCP_FASTOPEN", "0")]);
+    wait_tcp(server_port).await;
+    let _client = spawn_client(server_port, socks_port);
+    wait_tcp(socks_port).await;
+
+    let mut stream = socks5_connect(socks_port, "127.0.0.1", echo_port).await;
+    stream.write_all(b"no-tfo").await.unwrap();
+    let mut buf = [0u8; 32];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("timeout")
+        .expect("read");
+    assert!(buf[..n].windows(b"no-tfo".len()).any(|w| w == b"no-tfo"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn tcp_e2e_multiple_requests() {
     let echo_port = spawn_echo().await;
     let server_port = random_tcp_port();

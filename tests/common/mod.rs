@@ -62,6 +62,14 @@ impl Drop for ChildGuard {
 }
 
 pub fn spawn_server(listen_port: u16, quic: bool) -> ChildGuard {
+    spawn_server_with_envs(listen_port, quic, &[])
+}
+
+pub fn spawn_server_with_envs(
+    listen_port: u16,
+    quic: bool,
+    extra_env: &[(&str, &str)],
+) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_snell-server");
     let mut cmd = Command::new(bin);
     cmd.arg(format!("0.0.0.0:{listen_port}"))
@@ -72,17 +80,29 @@ pub fn spawn_server(listen_port: u16, quic: bool) -> ChildGuard {
     if quic {
         cmd.env("QUIC", "1");
     }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     ChildGuard(cmd.spawn().expect("spawn snell-server"))
 }
 
 pub fn spawn_client(server_port: u16, socks_port: u16) -> ChildGuard {
+    spawn_client_with_envs(server_port, socks_port, &[])
+}
+
+pub fn spawn_client_with_envs(
+    server_port: u16,
+    socks_port: u16,
+    extra_env: &[(&str, &str)],
+) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_snell-client");
-    let child = Command::new(bin)
-        .env("PSK", PSK)
+    let mut cmd = Command::new(bin);
+    cmd.env("PSK", PSK)
         .env("SNELL_SERVER", format!("127.0.0.1:{server_port}"))
         .env("LISTEN", format!("127.0.0.1:{socks_port}"))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn snell-client");
-    ChildGuard(child)
+        .kill_on_drop(true);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    ChildGuard(cmd.spawn().expect("spawn snell-client"))
 }

@@ -65,6 +65,8 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | `PSK` | ✅ | — | Pre-shared key |
 | `EGRESS_INTERFACE` | — | system default | Bind outgoing connections to this interface |
 | `QUIC` | — | `0` | Set to `1` to enable QUIC proxy mode |
+| `TCP_FASTOPEN` | — | `1` | Server-side TFO. Set to `0` to disable. See [TCP Fast Open](#tcp-fast-open) |
+| `TCP_FASTOPEN_OUT` | — | `0` | Set to `1` to opt outbound CONNECT sockets into client-side TFO |
 
 ```bash
 PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
@@ -79,6 +81,7 @@ PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
 | `PSK` | ✅ | — | Must match the server's PSK |
 | `SNELL_SERVER` | — | `127.0.0.1:6180` | Snell server `host:port` |
 | `LISTEN` | — | `127.0.0.1:1080` | Local SOCKS5 bind address |
+| `TCP_FASTOPEN` | — | `0` | Set to `1` to opt the outbound socket to the snell server into client-side TFO |
 
 **Run:**
 
@@ -144,6 +147,32 @@ sudo setcap cap_net_raw+ep ./snell-server
 
 PSK=your-key EGRESS_INTERFACE=eth0 ./snell-server
 ```
+
+## TCP Fast Open
+
+Server-side TFO is on by default and the server prints
+`<NOTIFY> TCP Fast Open enabled` at startup when the `setsockopt`
+succeeds. The kernel still needs the server bit:
+
+```bash
+# Linux — enable both client (1) and server (2) bits
+sudo sysctl -w net.ipv4.tcp_fastopen=3
+# Persist
+echo 'net.ipv4.tcp_fastopen=3' | sudo tee /etc/sysctl.d/99-tfo.conf
+
+# macOS
+sudo sysctl -w net.inet.tcp.fastopen=3
+```
+
+In Docker the host sysctl applies — the container can't change it.
+Set `--sysctl net.ipv4.tcp_fastopen=3` on `docker run` or rely on the
+host's value.
+
+Set `TCP_FASTOPEN=0` to skip the setsockopt entirely.
+
+Outbound TFO (`TCP_FASTOPEN_OUT=1` on server, `TCP_FASTOPEN=1` on the
+client binary) is opt-in. Linux >= 4.11 only; the macOS client-side
+path requires `connectx()` and is currently a no-op.
 
 ## systemd Socket Activation
 
