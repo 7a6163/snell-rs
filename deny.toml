@@ -1,0 +1,15 @@
+# cargo-deny configuration.
+#
+# Scope: advisories only. Licenses / bans / sources are intentionally not
+# enforced yet — adopt those once we have a written policy.
+#
+# Schema: cargo-deny 0.16+ "v2" advisories config — vulnerabilities and
+# unmaintained crates default to error; yanked crates emit warnings.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
