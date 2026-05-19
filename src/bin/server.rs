@@ -48,7 +48,15 @@ use tokio_rustls::{TlsAcceptor, rustls};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
-const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+// T2-F: Per-phase handshake budgets. The single 30s blanket was too generous
+// for slowloris-style attackers (one socket could squat for the full window
+// even before any argon2id work). These splits keep ~10x headroom over real
+// handshakes on high-latency mobile links (~300 ms RTT) while shrinking the
+// per-connection occupancy ceiling from 30 s to ~25 s worst case.
+const PEEK_TIMEOUT_SECS: u64 = 5; //   first-byte obfs detect peek
+const OBFS_HANDSHAKE_TIMEOUT_SECS: u64 = 10; //   TLS accept / HTTP absorb
+const SALT_HANDSHAKE_TIMEOUT_SECS: u64 = 10; //   16-byte salt read + argon2id
+
 const MAX_CONCURRENT_CONNS: usize = 4096;
 
 // C-3: Cap on concurrent QUIC sessions to bound argon2id work.
@@ -590,24 +598,26 @@ async fn dispatch(
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
-    // Bound only the obfs handshake (peek + optional HTTP/TLS upgrade).
-    // The relay loop inside handle() must not be bounded.
-    let handshake_deadline = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+    // T2-F: each handshake phase has its own budget so a slow attacker can't
+    // squat the full 30 s on a single phase. The relay loop inside handle()
+    // is intentionally unbounded — only the handshake stages are timed.
+    let peek_budget = Duration::from_secs(PEEK_TIMEOUT_SECS);
+    let obfs_budget = Duration::from_secs(OBFS_HANDSHAKE_TIMEOUT_SECS);
 
     let mut first = [0u8; 1];
-    tokio::time::timeout(handshake_deadline, conn.peek(&mut first))
+    tokio::time::timeout(peek_budget, conn.peek(&mut first))
         .await
         .map_err(|_| anyhow::anyhow!("obfs peek timeout"))??;
 
     match first[0] {
         0x16 => {
-            let stream = tokio::time::timeout(handshake_deadline, tls.accept(conn))
+            let stream = tokio::time::timeout(obfs_budget, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
             handle(stream, psk, iface, block_private, tfo_out, salt_cache).await
         }
         b'G' => {
-            tokio::time::timeout(handshake_deadline, absorb_http_request(&mut conn))
+            tokio::time::timeout(obfs_budget, absorb_http_request(&mut conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("HTTP obfs timeout"))??;
             conn.write_all(
@@ -663,10 +673,10 @@ async fn handle<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Bound the initial salt-exchange read; the relay loop below must not be bounded.
+    // Bound the salt-exchange + KDF phase; the relay loop below must not be bounded.
     let mut client_salt = [0u8; SALT_LEN];
     tokio::time::timeout(
-        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
         conn.read_exact(&mut client_salt),
     )
     .await

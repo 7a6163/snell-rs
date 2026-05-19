@@ -103,6 +103,69 @@ async fn tcp_handshake_replay_is_rejected() {
     }
 }
 
+/// HTTP-obfs dispatch path: when the first byte is 'G' the server absorbs
+/// an HTTP GET request, replies with `101 Switching Protocols`, then handles
+/// the rest as a plain Snell handshake. This covers the obfs_budget timeout
+/// callsite that the snell-client tests never reach (they go straight to
+/// plain Snell).
+#[tokio::test]
+#[serial_test::serial]
+async fn http_obfs_handshake_completes() {
+    let target_port = spawn_tcp_target().await;
+    let server_port = random_tcp_port();
+
+    let _server = spawn_server(server_port, false);
+    wait_tcp(server_port).await;
+
+    let mut s = TcpStream::connect(("127.0.0.1", server_port))
+        .await
+        .unwrap();
+
+    // Send an HTTP GET to trigger the 'G' obfs dispatch arm.
+    s.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the server's `101 Switching Protocols` reply (terminator \r\n\r\n).
+    let mut accum = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = timeout(Duration::from_secs(2), s.read(&mut buf))
+            .await
+            .expect("101 reply timeout")
+            .expect("101 read failed");
+        if n == 0 {
+            panic!("server closed before sending 101");
+        }
+        accum.extend_from_slice(&buf[..n]);
+        if accum.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if accum.len() > 1024 {
+            panic!("101 response too long without terminator: {:?}", accum);
+        }
+    }
+    assert!(
+        accum.starts_with(b"HTTP/1.1 101"),
+        "unexpected obfs reply: {:?}",
+        accum
+    );
+
+    // After the 101, write a plain-Snell handshake against the obfs'd stream.
+    // The server is now in handle() expecting [16-byte salt][sealed chunk...].
+    let (handshake, _) = build_handshake(PSK.as_bytes(), "127.0.0.1", target_port);
+    s.write_all(&handshake).await.unwrap();
+
+    // Brief read window — server should NOT close immediately; it's setting
+    // up the relay to the target. Either some bytes or a timeout means alive.
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_millis(300), s.read(&mut buf)).await {
+        Ok(Ok(0)) => panic!("server closed obfs+handshake connection unexpectedly"),
+        Ok(Err(e)) => panic!("server reset obfs+handshake connection: {e}"),
+        _ => {}
+    }
+}
+
 /// Negative control: distinct salts must both be accepted. Without this we
 /// can't tell whether the previous test passes because of the salt cache or
 /// because the server is broken in general.
