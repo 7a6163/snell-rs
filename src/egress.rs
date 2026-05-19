@@ -33,7 +33,7 @@ pub async fn connect_tcp(addr: SocketAddr, iface: Option<&str>, tfo: bool) -> Re
         // on the project's 1.95 toolchain pin (rust-toolchain.toml).
         if tfo && let Err(e) = crate::tfo::enable_connect_tfo(sock.as_raw_fd()) {
             // Best-effort: log and continue without TFO if the kernel rejects it.
-            eprintln!("TCP Fast Open connect setsockopt failed ({e}); continuing without TFO");
+            tracing::warn!(error = %e, "TCP Fast Open connect setsockopt failed; continuing without TFO");
         }
     }
     #[cfg(not(unix))]

@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod cipher;
 pub mod egress;
+pub mod logging;
 pub mod quic;
 pub mod relay;
 pub mod salt_cache;

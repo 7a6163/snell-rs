@@ -16,6 +16,8 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    snell::logging::init();
+
     // Graceful shutdown on SIGTERM/SIGINT so atexit handlers run
     // (systemd restart lifecycle + LLVM coverage profile flush during tests).
     #[cfg(unix)]
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
         let psk = psk.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(conn, server, &psk, tfo_out).await {
-                eprintln!("error: {e}");
+                tracing::error!(error = %e, "client connection failed");
             }
         });
     }
@@ -96,7 +98,7 @@ async fn connect_server(server: SocketAddr, tfo_out: bool) -> anyhow::Result<Tcp
     {
         use std::os::unix::io::AsRawFd;
         if let Err(e) = snell::tfo::enable_connect_tfo(sock.as_raw_fd()) {
-            eprintln!("TCP Fast Open connect setsockopt failed ({e}); continuing without TFO");
+            tracing::warn!(error = %e, "TCP Fast Open connect setsockopt failed; continuing without TFO");
         }
     }
     Ok(sock.connect(server).await?)
