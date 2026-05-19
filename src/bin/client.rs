@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,11 +36,13 @@ async fn main() -> Result<()> {
     let server: SocketAddr = std::env::var("SNELL_SERVER")
         .unwrap_or_else(|_| "127.0.0.1:6180".into())
         .parse()?;
-    let psk = Arc::new(
+    // T2-G: Wrap in Zeroizing so the PSK bytes are scrubbed when the Arc's
+    // final clone is dropped (best-effort defense against core dumps / swap).
+    let psk: Arc<Zeroizing<Vec<u8>>> = Arc::new(Zeroizing::new(
         std::env::var("PSK")
             .map_err(|_| anyhow::anyhow!("PSK environment variable is required"))?
             .into_bytes(),
-    );
+    ));
     let listen: SocketAddr = std::env::var("LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:1080".into())
         .parse()?;

@@ -44,9 +44,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::interval;
 use tokio_rustls::{TlsAcceptor, rustls};
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+
+/// PSK byte buffer that zeros itself on drop. Wrap in `Arc<...>` so workers
+/// share the single allocation; when the last clone drops at process exit /
+/// teardown, the bytes are scrubbed (best-effort: defends against core dumps
+/// and swap, but not against transient compiler-spilled register copies).
+type Psk = Arc<Zeroizing<Vec<u8>>>;
 
 // T2-F: Per-phase handshake budgets. The single 30s blanket was too generous
 // for slowloris-style attackers (one socket could squat for the full window
@@ -125,7 +132,9 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     if psk_str.len() < 16 {
         anyhow::bail!("PSK must be at least 16 bytes (got {})", psk_str.len());
     }
-    let psk = Arc::new(psk_str.into_bytes());
+    // T2-G: Wrap in Zeroizing so the PSK bytes are scrubbed when the Arc's
+    // final clone is dropped (best-effort defense against core dumps / swap).
+    let psk: Psk = Arc::new(Zeroizing::new(psk_str.into_bytes()));
 
     let egress_iface: Option<Arc<String>> = std::env::var("EGRESS_INTERFACE").ok().map(Arc::new);
     let quic_enabled = std::env::var("QUIC").map(|v| v == "1").unwrap_or(false);
@@ -358,7 +367,7 @@ fn apply_listen_tfo(_ln: &TcpListener) -> bool {
 fn spawn_udp_listener(
     sock: tokio::net::UdpSocket,
     table: SessionTable,
-    psk: Arc<Vec<u8>>,
+    psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
     init_cooldown: IpCooldownMap,
@@ -428,7 +437,7 @@ fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
 async fn run_udp_relay(
     sock: Arc<tokio::net::UdpSocket>,
     table: SessionTable,
-    psk: Arc<Vec<u8>>,
+    psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
     init_cooldown: IpCooldownMap,
