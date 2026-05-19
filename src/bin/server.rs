@@ -68,6 +68,8 @@ const COOLDOWN_GC_IDLE_SECS: u64 = 60;
 type IpCooldownMap = Arc<parking_lot::Mutex<HashMap<IpAddr, std::time::Instant>>>;
 
 fn main() -> Result<()> {
+    snell::logging::init();
+
     // Read systemd FDs before any threads exist.
     #[cfg(unix)]
     let activation_fds = snell::activation::take_listener_fds();
@@ -247,7 +249,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         if tcp_handshake_cooldown_ms > 0
             && !cooldown_check_and_insert(&tcp_cooldown, peer.ip(), tcp_handshake_cooldown_ms)
         {
-            eprintln!("[{peer}] dropped: handshake rate-limited");
+            tracing::warn!(%peer, "dropped: handshake rate-limited");
             drop(conn);
             continue;
         }
@@ -255,7 +257,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         let permit = match conn_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("[{peer}] dropped: connection limit");
+                tracing::warn!(%peer, "dropped: connection limit");
                 continue;
             }
         };
@@ -276,7 +278,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
             )
             .await
             {
-                eprintln!("[{peer}] {e}");
+                tracing::error!(%peer, error = %e, "connection failed");
             }
         });
     }
@@ -331,8 +333,9 @@ fn apply_listen_tfo(_ln: &TcpListener) -> bool {
         match snell::tfo::enable_listen_tfo(_ln.as_raw_fd()) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!(
-                    "snell-server: TCP Fast Open setsockopt failed ({e}); continuing without TFO"
+                tracing::warn!(
+                    error = %e,
+                    "TCP Fast Open setsockopt failed; continuing without TFO"
                 );
                 false
             }
@@ -366,7 +369,7 @@ fn spawn_udp_listener(
         )
         .await
         {
-            eprintln!("[QUIC UDP] {e}");
+            tracing::error!(error = %e, "QUIC UDP relay loop fatal");
         }
     });
 }
@@ -443,7 +446,7 @@ async fn run_udp_relay(
 
         match (kind, session) {
             (snell::quic::PacketKind::Data, None) => {
-                eprintln!("[QUIC] data packet without session from {src}");
+                tracing::warn!(%src, "QUIC data packet without session");
             }
             (snell::quic::PacketKind::Data, Some(session)) => {
                 session.touch();
@@ -482,19 +485,19 @@ async fn handle_quic_init(
     let n = packet.len();
 
     if n < 16 + snell::cipher::HDR_CT_LEN + 16 {
-        eprintln!("[QUIC] init too short from {src}");
+        tracing::warn!(%src, "QUIC init too short");
         return;
     }
 
     // C-3: Per-IP rate limit to throttle argon2id work.
     if !cooldown_check_and_insert(init_cooldown, src.ip(), INIT_COOLDOWN_MS) {
-        eprintln!("[QUIC] init rate-limited from {src}");
+        tracing::warn!(%src, "QUIC init rate-limited");
         return;
     }
 
     // C-3: Cap on total concurrent sessions.
     if table.read().await.len() >= MAX_UDP_SESSIONS {
-        eprintln!("[QUIC] session table full, dropping init from {src}");
+        tracing::warn!(%src, "QUIC session table full, dropping init");
         return;
     }
 
@@ -503,18 +506,18 @@ async fn handle_quic_init(
 
     // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
     if !salt_cache.check_and_insert(&salt) {
-        eprintln!("[QUIC] salt replay detected from {src}, dropping");
+        tracing::warn!(%src, "QUIC salt replay detected, dropping");
         return;
     }
 
     let req = match snell::quic::decrypt_init(psk, &salt, &packet[16..]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[QUIC] decrypt fail from {src}: {e}");
+            tracing::warn!(%src, error = %e, "QUIC decrypt failed");
             return;
         }
     };
-    eprintln!("[QUIC] CONNECT_UDP from {src} -> {}:{}", req.host, req.port);
+    tracing::debug!(%src, host = %req.host, port = req.port, "QUIC CONNECT_UDP");
 
     // Resolve and SSRF-check
     let target_addr: SocketAddr =
@@ -527,7 +530,7 @@ async fn handle_quic_init(
             None => return,
         };
     if !is_safe_target(&target_addr, block_private) {
-        eprintln!("[QUIC SSRF] blocked {target_addr}");
+        tracing::warn!(%target_addr, "QUIC SSRF blocked");
         return;
     }
 
@@ -535,12 +538,12 @@ async fn handle_quic_init(
     let target_sock = match snell::egress::bind_udp("0.0.0.0:0".parse().expect("static"), iface) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[QUIC] bind: {e}");
+            tracing::warn!(error = %e, "QUIC outbound bind failed");
             return;
         }
     };
     if let Err(e) = target_sock.connect(target_addr).await {
-        eprintln!("[QUIC] connect: {e}");
+        tracing::warn!(error = %e, "QUIC outbound connect failed");
         return;
     }
     let target_sock = Arc::new(target_sock);
@@ -695,7 +698,7 @@ where
             bail!("unknown command {:#04x}", req.command);
         }
 
-        eprintln!("CONNECT → {}:{}", req.host, req.port);
+        tracing::debug!(host = %req.host, port = req.port, "CONNECT");
 
         let target_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
             .await?
@@ -703,9 +706,11 @@ where
             .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
 
         if !is_safe_target(&target_addr, block_private) {
-            eprintln!(
-                "[SSRF] blocked CONNECT → {}:{} (resolved to {})",
-                req.host, req.port, target_addr
+            tracing::warn!(
+                host = %req.host,
+                port = req.port,
+                resolved = %target_addr,
+                "SSRF blocked CONNECT"
             );
             let mut r = vec![RESP_ERROR, 0u8, 9];
             r.extend_from_slice(b"forbidden");
@@ -716,7 +721,7 @@ where
         let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[connect-fail] {}:{}: {e}", req.host, req.port); // server-side detail
+                tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
                 // Generic public error — don't leak internal details
                 let msg = b"connection failed";
                 let mut r = vec![RESP_ERROR, 0u8, msg.len() as u8];
