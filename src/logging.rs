@@ -30,3 +30,52 @@ pub fn init() {
         let _ = fmt().with_env_filter(filter).with_target(false).try_init();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    // Both branches of init() run their full body — `try_init` returns Err
+    // silently when a global subscriber is already installed, which is the
+    // expected steady state after the first test in this module runs.
+    //
+    // Tests are serialized because they mutate the LOG_FORMAT env var, which
+    // is process-global and would race with parallel test execution.
+
+    #[test]
+    #[serial]
+    fn init_text_branch_does_not_panic() {
+        // SAFETY: `#[serial]` ensures no other test is reading/writing env
+        // vars concurrently; remove_var has no other ordering hazard in tests.
+        unsafe {
+            std::env::remove_var("LOG_FORMAT");
+        }
+        init();
+    }
+
+    #[test]
+    #[serial]
+    fn init_json_branch_does_not_panic() {
+        // SAFETY: same as above — serialized, single-writer.
+        unsafe {
+            std::env::set_var("LOG_FORMAT", "json");
+        }
+        init();
+        unsafe {
+            std::env::remove_var("LOG_FORMAT");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn init_envfilter_default_when_rust_log_unset() {
+        // Exercises the `unwrap_or_else(|_| EnvFilter::new("info"))` path.
+        // SAFETY: serialized; tests aren't reading RUST_LOG concurrently.
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var("LOG_FORMAT");
+        }
+        init();
+    }
+}
