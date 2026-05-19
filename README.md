@@ -68,6 +68,8 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | `TCP_FASTOPEN` | — | `1` | Server-side TFO. Set to `0` to disable. See [TCP Fast Open](#tcp-fast-open) |
 | `TCP_FASTOPEN_OUT` | — | `0` | Set to `1` to opt outbound CONNECT sockets into client-side TFO |
 | `TCP_HANDSHAKE_COOLDOWN_MS` | — | `100` | Per-source-IP minimum ms between fresh TCP handshakes. Bounds argon2id DoS from a single IP. `0` disables |
+| `RUST_LOG` | — | `info` | [tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive. Examples: `debug`, `snell::quic=debug,info`, `error` |
+| `LOG_FORMAT` | — | text | Set to `json` for line-delimited JSON output (for Loki / ELK ingest) |
 
 ```bash
 PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
@@ -83,6 +85,8 @@ PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
 | `SNELL_SERVER` | — | `127.0.0.1:6180` | Snell server `host:port` |
 | `LISTEN` | — | `127.0.0.1:1080` | Local SOCKS5 bind address |
 | `TCP_FASTOPEN` | — | `0` | Set to `1` to opt the outbound socket to the snell server into client-side TFO |
+| `RUST_LOG` | — | `info` | Same EnvFilter syntax as the server. `RUST_LOG=debug` to surface per-connection traces |
+| `LOG_FORMAT` | — | text | Set to `json` for line-delimited JSON output |
 
 **Run:**
 
