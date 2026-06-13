@@ -4,6 +4,7 @@ version = "5.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Open-source Snell v5 proxy protocol implementation"
+license = "MIT"
 
 [lib]
 name = "snell"
