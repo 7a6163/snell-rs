@@ -150,6 +150,25 @@ mod tests {
         assert_eq!(p.decode_first_frame(&frame).unwrap(), salt);
     }
 
+    #[test]
+    fn encode_accepts_correct_length_filler_and_rejects_wrong() {
+        let p = Profile::derive(b"test-psk-0123456789abcdef");
+        let salt = [0u8; 16];
+        let n = p.frame_len();
+        // Correct-length filler is accepted and still round-trips the salt.
+        let frame = p.encode_first_frame(&salt, Some(&vec![0xAB; n])).unwrap();
+        assert_eq!(frame.len(), n);
+        assert_eq!(p.decode_first_frame(&frame).unwrap(), salt);
+        // Wrong-length filler is rejected.
+        assert!(p.encode_first_frame(&salt, Some(&[0u8; 3])).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length_frame() {
+        let p = Profile::derive(b"test-psk-0123456789abcdef");
+        assert!(p.decode_first_frame(&[0u8; 5]).is_err());
+    }
+
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }

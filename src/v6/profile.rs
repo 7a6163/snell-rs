@@ -185,4 +185,24 @@ mod tests {
         // F_field = param(18, 0x51A7, 17, 251) -> 251 for PSK A.
         assert_eq!(p.param(18, 0x51A7, 17, 251), 251);
     }
+
+    #[test]
+    fn draw_covers_all_route_arms_and_high_category() {
+        let p = Profile::derive(b"test-psk-0123456789abcdef");
+        // Each cat maps through CATMAP to a distinct ROUTE arm.
+        let _ = p.draw(2, 0); //  CATMAP[2]=0x02 -> seed+192
+        let _ = p.draw(21, 0); // CATMAP[21]=0x06 -> seed+168
+        let _ = p.draw(28, 0); // CATMAP[28]=0x08 -> seed+216
+        let _ = p.draw(4, 0); //  CATMAP[4]=0xf8 -> seed+96 fallback
+        let _ = p.draw(40, 0); // cat > 39 -> seed+96 (out-of-range branch)
+        // Deterministic for identical inputs.
+        assert_eq!(p.draw(2, 0), p.draw(2, 0));
+    }
+
+    #[test]
+    fn param_returns_lo_when_hi_not_greater() {
+        let p = Profile::derive(b"test-psk-0123456789abcdef");
+        assert_eq!(p.param(0, 0, 5, 5), 5); // hi == lo
+        assert_eq!(p.param(0, 0, 9, 3), 9); // hi < lo
+    }
 }
