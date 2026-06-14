@@ -10,6 +10,7 @@ services:
       PSK: ${PSK:?PSK required (min 16 chars)}
       QUIC: ${QUIC:-0}
       EGRESS_INTERFACE: ${EGRESS_INTERFACE:-}
+      IPV6: ${IPV6:-0}
       BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-0}
     cap_add:
       - NET_RAW

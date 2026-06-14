@@ -5,6 +5,9 @@
 //! Environment variables:
 //!   PSK                   Pre-shared key (required, min 16 chars)
 //!   EGRESS_INTERFACE      Bind outgoing connections to this network interface
+//!   IPV6=1                Allow IPv6 outbound targets. Default off (IPv4-only
+//!                         egress), matching official snell-server `ipv6=false`:
+//!                         AAAA results are skipped unless this is set.
 //!   QUIC=1                Enable QUIC proxy mode (opens UDP on same port)
 //!   BLOCK_PRIVATE_TARGETS=1  Refuse to proxy to loopback/private/reserved addresses
 //!                            (default: allow — proxying to LAN is a legit use case)
@@ -145,6 +148,10 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let block_private = std::env::var("BLOCK_PRIVATE_TARGETS")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // IPv6 egress toggle. Default false (IPv4-only outbound) to match official
+    // snell-server's `ipv6=false`: AAAA results are skipped unless explicitly
+    // enabled. Set IPV6=1 to allow IPv6 targets.
+    let ipv6 = std::env::var("IPV6").map(|v| v == "1").unwrap_or(false);
     // TCP_FASTOPEN defaults to on (matches official snell-server).
     // Explicitly set TCP_FASTOPEN=0 to disable. Anything else (including unset
     // or "1") leaves it enabled. The effective state still requires the kernel
@@ -200,6 +207,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                     psk.clone(),
                     egress_iface.clone(),
                     block_private,
+                    ipv6,
                     init_cooldown.clone(),
                     salt_cache.clone(),
                 );
@@ -220,6 +228,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 psk.clone(),
                 egress_iface.clone(),
                 block_private,
+                ipv6,
                 init_cooldown.clone(),
                 salt_cache.clone(),
             );
@@ -290,6 +299,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 &tls_acceptor,
                 iface.as_deref().map(String::as_str),
                 block_private,
+                ipv6,
                 tfo_out,
                 &salt_cache_per_conn,
             )
@@ -364,12 +374,14 @@ fn apply_listen_tfo(_ln: &TcpListener) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_udp_listener(
     sock: tokio::net::UdpSocket,
     table: SessionTable,
     psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
+    ipv6: bool,
     init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) {
@@ -381,6 +393,7 @@ fn spawn_udp_listener(
             psk,
             iface,
             block_private,
+            ipv6,
             init_cooldown,
             salt_cache,
         )
@@ -433,13 +446,32 @@ fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
     }
 }
 
+/// Pick an outbound target address from resolver results, honoring the IPv6
+/// egress toggle. Mirrors official snell-server's `ipv6` option (default false):
+/// when `ipv6` is false, AAAA results are skipped and only an IPv4 address is
+/// used; when true, the first resolved address of any family is taken. A host
+/// that resolves only to IPv6 yields `None` while the toggle is off — the
+/// caller surfaces that as a DNS failure, matching the official behavior.
+fn select_egress_addr(
+    mut addrs: impl Iterator<Item = SocketAddr>,
+    ipv6: bool,
+) -> Option<SocketAddr> {
+    if ipv6 {
+        addrs.next()
+    } else {
+        addrs.find(SocketAddr::is_ipv4)
+    }
+}
+
 /// UDP relay loop: classify datagrams by byte[0] and route by source sockaddr.
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_relay(
     sock: Arc<tokio::net::UdpSocket>,
     table: SessionTable,
     psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
+    ipv6: bool,
     init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) -> Result<()> {
@@ -478,6 +510,7 @@ async fn run_udp_relay(
                     &psk,
                     iface.as_deref().map(String::as_str),
                     block_private,
+                    ipv6,
                     &init_cooldown,
                     &salt_cache,
                 )
@@ -496,6 +529,7 @@ async fn handle_quic_init(
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
+    ipv6: bool,
     init_cooldown: &IpCooldownMap,
     salt_cache: &SaltCache,
 ) {
@@ -541,7 +575,7 @@ async fn handle_quic_init(
         match tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
             .await
             .ok()
-            .and_then(|mut it| it.next())
+            .and_then(|it| select_egress_addr(it, ipv6))
         {
             Some(a) => a,
             None => return,
@@ -598,12 +632,14 @@ async fn handle_quic_init(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     mut conn: TcpStream,
     psk: &[u8],
     tls: &TlsAcceptor,
     iface: Option<&str>,
     block_private: bool,
+    ipv6: bool,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
@@ -623,7 +659,7 @@ async fn dispatch(
             let stream = tokio::time::timeout(obfs_budget, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
-            handle(stream, psk, iface, block_private, tfo_out, salt_cache).await
+            handle(stream, psk, iface, block_private, ipv6, tfo_out, salt_cache).await
         }
         b'G' => {
             tokio::time::timeout(obfs_budget, absorb_http_request(&mut conn))
@@ -635,9 +671,9 @@ async fn dispatch(
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, block_private, tfo_out, salt_cache).await
+            handle(conn, psk, iface, block_private, ipv6, tfo_out, salt_cache).await
         }
-        _ => handle(conn, psk, iface, block_private, tfo_out, salt_cache).await,
+        _ => handle(conn, psk, iface, block_private, ipv6, tfo_out, salt_cache).await,
     }
 }
 
@@ -671,11 +707,13 @@ async fn absorb_http_request(conn: &mut TcpStream) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle<S>(
     mut conn: S,
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
+    ipv6: bool,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()>
@@ -719,10 +757,11 @@ where
 
         tracing::debug!(host = %req.host, port = req.port, "CONNECT");
 
-        let target_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
-            .await?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
+        let target_addr: SocketAddr = select_egress_addr(
+            tokio::net::lookup_host(format!("{}:{}", req.host, req.port)).await?,
+            ipv6,
+        )
+        .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
 
         if !is_safe_target(&target_addr, block_private) {
             tracing::warn!(
@@ -1014,5 +1053,51 @@ mod tests {
     fn accepts_public_ipv6() {
         assert!(is_safe_target(&v6("2606:4700:4700::1111"), true));
         assert!(is_safe_target(&v6("2001:4860:4860::8888"), true));
+    }
+
+    // ── IPv6 egress toggle (select_egress_addr) ───────────────────────────────
+
+    #[test]
+    fn egress_ipv4_only_skips_ipv6_when_toggle_off() {
+        // ipv6=false (default): an AAAA-first result list must yield the IPv4 entry.
+        let addrs = vec![v6("2606:4700:4700::1111"), v4(1, 1, 1, 1)];
+        assert_eq!(
+            select_egress_addr(addrs.into_iter(), false),
+            Some(v4(1, 1, 1, 1))
+        );
+    }
+
+    #[test]
+    fn egress_ipv4_only_returns_none_for_ipv6_only_host() {
+        // ipv6=false against an IPv6-only host: no usable address — the caller
+        // surfaces this as a DNS failure, matching official snell-server.
+        let addrs = vec![v6("2606:4700:4700::1111"), v6("2606:4700:4700::1001")];
+        assert_eq!(select_egress_addr(addrs.into_iter(), false), None);
+    }
+
+    #[test]
+    fn egress_ipv6_enabled_takes_first_of_any_family() {
+        // ipv6=true: first resolved address wins regardless of family.
+        let addrs = vec![v6("2606:4700:4700::1111"), v4(1, 1, 1, 1)];
+        assert_eq!(
+            select_egress_addr(addrs.into_iter(), true),
+            Some(v6("2606:4700:4700::1111"))
+        );
+    }
+
+    #[test]
+    fn egress_ipv4_only_keeps_first_ipv4_result() {
+        let addrs = vec![v4(8, 8, 8, 8), v6("2001:4860:4860::8888")];
+        assert_eq!(
+            select_egress_addr(addrs.into_iter(), false),
+            Some(v4(8, 8, 8, 8))
+        );
+    }
+
+    #[test]
+    fn egress_empty_resolution_is_none() {
+        let empty: Vec<SocketAddr> = vec![];
+        assert_eq!(select_egress_addr(empty.clone().into_iter(), false), None);
+        assert_eq!(select_egress_addr(empty.into_iter(), true), None);
     }
 }

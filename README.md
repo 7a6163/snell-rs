@@ -64,6 +64,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 |---|---|---|---|
 | `PSK` | ✅ | — | Pre-shared key |
 | `EGRESS_INTERFACE` | — | system default | Bind outgoing connections to this interface |
+| `IPV6` | — | `0` | Set to `1` to allow IPv6 outbound targets. Default off (IPv4-only egress), matching official snell-server `ipv6=false` |
 | `QUIC` | — | `0` | Set to `1` to enable QUIC proxy mode |
 | `TCP_FASTOPEN` | — | `1` | Server-side TFO. Set to `0` to disable. See [TCP Fast Open](#tcp-fast-open) |
 | `TCP_FASTOPEN_OUT` | — | `0` | Set to `1` to opt outbound CONNECT sockets into client-side TFO |
