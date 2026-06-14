@@ -33,6 +33,7 @@ parking_lot  = "0.12"
 tracing      = "0.1"
 zeroize      = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 serial_test  = "3"
