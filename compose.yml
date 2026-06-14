@@ -11,6 +11,7 @@ services:
       QUIC: ${QUIC:-0}
       EGRESS_INTERFACE: ${EGRESS_INTERFACE:-}
       IPV6: ${IPV6:-0}
+      DNS: ${DNS:-}
       BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-0}
     cap_add:
       - NET_RAW
