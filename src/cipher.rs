@@ -8,7 +8,7 @@
 
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
-    aead::{Aead, AeadInPlace, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -60,6 +60,14 @@ impl SnellCipher {
     /// Encrypts header and payload in place inside the output buffer to avoid
     /// the intermediate `Vec<u8>` that `Aead::encrypt` would otherwise return.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.seal_with_aad(plaintext, &[])
+    }
+
+    /// Like [`seal`](Self::seal) but uses `header_aad` as the header chunk's AEAD
+    /// AAD. v5 calls this with an empty `header_aad`; v6 passes the per-chunk
+    /// prefix bytes so they authenticate the header. The payload AAD stays empty
+    /// in both versions.
+    pub fn seal_with_aad(&mut self, plaintext: &[u8], header_aad: &[u8]) -> Result<Vec<u8>> {
         if plaintext.len() > 0xffff {
             bail!("plaintext too large: {} bytes (max 65535)", plaintext.len());
         }
@@ -68,11 +76,11 @@ impl SnellCipher {
         // Layout: [hdr_pt(7) | hdr_tag(16) | payload_pt(n) | payload_tag(16)]
         let mut out = Vec::with_capacity(HDR_CT_LEN + n + 16);
 
-        // Header plaintext → encrypt in place → append 16-byte tag.
+        // Header plaintext → encrypt in place (AAD = header_aad) → append tag.
         out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, (n >> 8) as u8, (n & 0xff) as u8]);
         let hdr_tag = self
             .aead
-            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], &mut out[..7])
+            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), header_aad, &mut out[..7])
             .map_err(|_| anyhow::anyhow!("header AEAD encrypt"))?;
         out.extend_from_slice(&hdr_tag);
         self.inc();
@@ -111,9 +119,25 @@ impl SnellCipher {
     /// Returns `None` for a zero chunk (payload_len == 0).
     /// Nonce is incremented only on successful decryption.
     pub fn open_header(&mut self, ct: &[u8; HDR_CT_LEN]) -> Result<Option<(usize, usize)>> {
+        self.open_header_with_aad(ct, &[])
+    }
+
+    /// Like [`open_header`](Self::open_header) but verifies the header against
+    /// `aad`. v6 passes the per-chunk prefix bytes; v5 passes empty.
+    pub fn open_header_with_aad(
+        &mut self,
+        ct: &[u8; HDR_CT_LEN],
+        aad: &[u8],
+    ) -> Result<Option<(usize, usize)>> {
         let pt = self
             .aead
-            .decrypt(Nonce::from_slice(&self.nonce), ct.as_slice())
+            .decrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: ct.as_slice(),
+                    aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("header authentication failed"))?;
         self.inc();
         if pt.len() != 7 || pt[0] != 0x04 {
