@@ -1,14 +1,21 @@
 //! snell-client — Snell v5 SOCKS5 proxy client.
 //! Usage: PSK=yourpsk SNELL_SERVER=host:port [LISTEN=127.0.0.1:1080] snell-client
 //!
+//! Handles SOCKS5 CONNECT (TCP) and UDP ASSOCIATE (UDP-over-TCP): UDP datagrams
+//! from a SOCKS5-UDP app are relayed through the Snell tunnel via CMD_CONNECT_UDP.
+//!
 //! Optional env vars:
 //!   TCP_FASTOPEN=1  Opt the outbound socket to the snell server into
 //!                   client-side TFO (Linux >= 4.11 only; no-op on macOS).
 
 use anyhow::{Result, bail};
+use parking_lot::Mutex;
 use snell::cipher::{SALT_LEN, SnellCipher};
-use snell::snell::{RESP_TUNNEL, read_chunk, write_chunk};
-use std::{net::SocketAddr, sync::Arc};
+use snell::snell::{CMD_CONNECT_UDP, RESP_TUNNEL, read_chunk, write_chunk};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -125,9 +132,7 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
     if req_hdr[0] != 0x05 {
         bail!("invalid SOCKS5 request version");
     }
-    if req_hdr[1] != 0x01 {
-        bail!("unsupported SOCKS5 command {:#04x}", req_hdr[1]);
-    }
+    let socks_cmd = req_hdr[1];
 
     let (host, port) = match req_hdr[3] {
         0x01 => {
@@ -159,6 +164,15 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
         }
         t => bail!("unsupported SOCKS5 ATYP {t:#04x}"),
     };
+
+    // UDP ASSOCIATE → Snell UoT bridge. The DST addr/port parsed above are the
+    // client's advertised source and are ignored (RFC 1928).
+    if socks_cmd == 0x03 {
+        return udp_associate(local, server, psk, tfo_out).await;
+    }
+    if socks_cmd != 0x01 {
+        bail!("unsupported SOCKS5 command {socks_cmd:#04x}");
+    }
 
     // Reply: success (bound addr 0.0.0.0:0)
     local
@@ -223,4 +237,165 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
 
     tokio::try_join!(up, down)?;
     Ok(())
+}
+
+/// SOCKS5 UDP ASSOCIATE → Snell UDP-over-TCP bridge.
+///
+/// Binds a local UDP relay socket, tells the SOCKS5 app where to send its
+/// datagrams (BND.ADDR/PORT), opens a `CONNECT_UDP` session to the snell server,
+/// and bridges local SOCKS5 UDP datagrams ↔ Snell UoT frames. The association
+/// lives while the SOCKS5 TCP control connection is open (RFC 1928).
+async fn udp_associate(
+    mut local: TcpStream,
+    server: SocketAddr,
+    psk: &[u8],
+    tfo_out: bool,
+) -> Result<()> {
+    // Relay socket on loopback — the SOCKS5 app is local.
+    let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let bound = udp.local_addr()?;
+
+    // SOCKS5 success reply with BND.ADDR/PORT = our relay socket.
+    let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+    match bound.ip() {
+        IpAddr::V4(v4) => reply.extend_from_slice(&v4.octets()),
+        IpAddr::V6(_) => bail!("UDP relay bound to unexpected IPv6 address"),
+    }
+    reply.extend_from_slice(&bound.port().to_be_bytes());
+    local.write_all(&reply).await?;
+
+    // Open the Snell CONNECT_UDP session: empty placeholder target (real targets
+    // travel per-datagram). Header: [ver=1][cmd=0x06][client_id_len=0][host_len=0][port=0].
+    let mut remote = connect_server(server, tfo_out).await?;
+    let (salt, mut c2s) = fresh_handshake_salt(psk)?;
+    remote.write_all(&salt).await?;
+    let open = [0x01u8, CMD_CONNECT_UDP, 0x00, 0x00, 0x00, 0x00];
+    remote.write_all(&c2s.seal(&open)?).await?;
+
+    let (mut rr, mut rw) = remote.into_split();
+    let psk_vec = psk.to_vec();
+    // The SOCKS5 app's source addr, learned on its first datagram.
+    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    // local UDP → tunnel
+    let up_udp = udp.clone();
+    let up_addr = client_addr.clone();
+    let up = async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = up_udp.recv_from(&mut buf).await?;
+            *up_addr.lock() = Some(src);
+            // SOCKS5 UDP header: [RSV2][FRAG1][ATYP][addr][port][data].
+            let Some((host, port, data)) = parse_socks5_udp(&buf[..n]) else {
+                continue; // drop fragments / malformed
+            };
+            let frame = snell::snell::encode_udp_request(&host, port, data);
+            write_chunk(&mut rw, &mut c2s, &frame).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // tunnel → local UDP
+    let down_udp = udp.clone();
+    let down_addr = client_addr.clone();
+    let down = async move {
+        let mut ss = [0u8; SALT_LEN];
+        rr.read_exact(&mut ss).await?;
+        let mut s2c = SnellCipher::new(&psk_vec, &ss)?;
+        let mut first = true;
+        while let Some(d) = read_chunk(&mut rr, &mut s2c).await? {
+            if first {
+                first = false;
+                if d.first() != Some(&RESP_TUNNEL) {
+                    bail!("expected ResponseTunnel, got {:?}", d.first());
+                }
+                if d.len() > 1 {
+                    forward_to_app(&d[1..], &down_udp, &down_addr).await;
+                }
+            } else {
+                forward_to_app(&d, &down_udp, &down_addr).await;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // The association ends when the SOCKS5 control connection closes.
+    let ctrl = async move {
+        let mut b = [0u8; 1];
+        loop {
+            match local.read(&mut b).await {
+                Ok(0) => break,
+                Ok(_) => continue, // control conn carries no data
+                Err(e) => return Err(anyhow::Error::from(e)),
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    tokio::select! {
+        r = up => r,
+        r = down => r,
+        r = ctrl => r,
+    }
+}
+
+/// Parse a SOCKS5 UDP request datagram into `(host, port, payload)`. Returns
+/// `None` for fragments (`FRAG != 0`) or malformed packets.
+fn parse_socks5_udp(buf: &[u8]) -> Option<(String, u16, &[u8])> {
+    // [RSV 2][FRAG 1][ATYP 1][addr][port 2][data]
+    if buf.len() < 4 || buf[2] != 0x00 {
+        return None;
+    }
+    let (host, mut pos) = match buf[3] {
+        0x01 => {
+            let b = buf.get(4..8)?;
+            (format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]), 8)
+        }
+        0x03 => {
+            let len = *buf.get(4)? as usize;
+            let d = buf.get(5..5 + len)?;
+            (std::str::from_utf8(d).ok()?.to_owned(), 5 + len)
+        }
+        0x04 => {
+            let b = buf.get(4..20)?;
+            let arr: [u8; 16] = b.try_into().ok()?;
+            (std::net::Ipv6Addr::from(arr).to_string(), 20)
+        }
+        _ => return None,
+    };
+    let pb = buf.get(pos..pos + 2)?;
+    let port = u16::from_be_bytes([pb[0], pb[1]]);
+    pos += 2;
+    Some((host, port, &buf[pos..]))
+}
+
+/// Wrap a Snell UoT response frame into a SOCKS5 UDP datagram and send it to the
+/// app's learned source address.
+async fn forward_to_app(
+    frame: &[u8],
+    udp: &tokio::net::UdpSocket,
+    client_addr: &Arc<Mutex<Option<SocketAddr>>>,
+) {
+    let Ok((src, payload)) = snell::snell::parse_udp_response(frame) else {
+        return;
+    };
+    let Some(dst) = *client_addr.lock() else {
+        return; // no app addr learned yet
+    };
+    // SOCKS5 UDP response: [RSV2=0][FRAG=0][ATYP][addr][port][data].
+    let mut pkt = vec![0x00, 0x00, 0x00];
+    match src.ip() {
+        IpAddr::V4(v4) => {
+            pkt.push(0x01);
+            pkt.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            pkt.push(0x04);
+            pkt.extend_from_slice(&v6.octets());
+        }
+    }
+    pkt.extend_from_slice(&src.port().to_be_bytes());
+    pkt.extend_from_slice(payload);
+    let _ = udp.send_to(&pkt, dst).await;
 }
