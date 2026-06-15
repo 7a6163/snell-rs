@@ -12,6 +12,7 @@ Compatible with [Surge](https://nssurge.com) as a Snell v5 server.
 - Connection reuse
 - Obfuscation: plain / `obfs=http` / `obfs=tls` (auto-detected)
 - Dynamic record sizing — adaptive chunk sizes for better performance under packet loss
+- UDP relay over TCP (`CMD_CONNECT_UDP`) — server and client (SOCKS5 UDP ASSOCIATE)
 - QUIC proxy mode — UDP relay with selective encryption
 - Egress interface binding
 - systemd socket activation
@@ -119,6 +120,7 @@ networksetup -setsocksfirewallproxystate "Wi-Fi" off
 
 - Plain Snell only — no client-side obfuscation. If the server is reached via `obfs=http` or `obfs=tls`, use Surge as the client instead.
 - Supports Snell v5 connection reuse for lower per-request latency.
+- Supports SOCKS5 UDP ASSOCIATE — UDP traffic is relayed over the Snell tunnel (see [UDP Relay](#udp-relay-over-tcp)).
 
 ## Obfuscation
 
@@ -137,6 +139,21 @@ my-server = snell, your-server-ip, 6180, psk=your-key, version=5, obfs=http, obf
 # TLS obfuscation
 my-server = snell, your-server-ip, 6180, psk=your-key, version=5, obfs=tls, obfs-host=example.com
 ```
+
+## UDP Relay over TCP
+
+The server handles Snell's `CMD_CONNECT_UDP` (0x06): UDP datagrams are framed
+and relayed inside the encrypted TCP tunnel (one datagram per Snell chunk), so
+UDP works over the same connection without QUIC. Domain targets are resolved
+server-side honoring `IPV6` / `DNS`, and the SSRF guard applies as for TCP.
+
+`snell-client` exposes this via **SOCKS5 UDP ASSOCIATE** — point a SOCKS5-UDP
+app at the client's `LISTEN` address and its datagrams tunnel through.
+
+> **Note:** the UoT wire format was implemented from the behaviour of the
+> open-source `opensnell` project and verified with an internal round-trip test;
+> it has not been validated byte-for-byte against an official Surge capture. No
+> server-side configuration is required.
 
 ## QUIC Proxy Mode
 

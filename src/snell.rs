@@ -1,7 +1,8 @@
 //! Snell v5 protocol layer — wire format identical to v3.
 
 use crate::cipher::{HDR_CT_LEN, SnellCipher};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const CMD_PING: u8 = 0x00;
@@ -118,6 +119,142 @@ pub async fn write_chunk_sized<W: AsyncWriteExt + Unpin>(
         w.write_all(&cipher.seal(chunk)?).await?;
     }
     Ok(())
+}
+
+// ── UDP-over-TCP (UoT) datagram framing ──────────────────────────────────────
+//
+// See PORTING_udp.md. One datagram = one Snell chunk (no inner length field).
+// The two directions are asymmetric:
+//   client → server: [0x01 opcode][addr][port BE][payload]
+//     addr = domain [len][bytes] | IPv4 [00 04][4] | IPv6 [00 06][16]
+//   server → client: [atyp 0x04|0x06][addr][port BE][payload]   (no opcode, IP-only)
+
+/// Per-datagram opcode prefixing every client→server UoT frame. Distinct from
+/// `CMD_CONNECT_UDP` (0x06), which only opens the session in the request header.
+pub const UDP_FORWARD: u8 = 0x01;
+
+/// A decoded client→server UoT datagram frame (borrows the source buffer).
+pub struct UdpRequest<'a> {
+    pub host: String,
+    pub port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Parse one client→server UoT datagram frame: `[0x01][addr][port BE][payload]`.
+/// Rejects an unknown opcode/address-type and any truncation.
+pub fn parse_udp_request(frame: &[u8]) -> Result<UdpRequest<'_>> {
+    if frame.first() != Some(&UDP_FORWARD) {
+        bail!("bad UDP forward opcode");
+    }
+    let (host, mut pos) = read_request_addr(frame, 1)?;
+    let port_bytes = frame
+        .get(pos..pos + 2)
+        .context("truncated UDP request port")?;
+    let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+    pos += 2;
+    Ok(UdpRequest {
+        host,
+        port,
+        payload: &frame[pos..],
+    })
+}
+
+/// Decode the request-direction address codec at `pos`, returning `(host, next)`.
+fn read_request_addr(frame: &[u8], pos: usize) -> Result<(String, usize)> {
+    let first = *frame.get(pos).context("truncated UDP address")?;
+    if first == 0x00 {
+        // Typed IP: next byte selects family.
+        match *frame.get(pos + 1).context("truncated UDP address type")? {
+            0x04 => {
+                let b = frame.get(pos + 2..pos + 6).context("truncated UDP IPv4")?;
+                let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+                Ok((ip.to_string(), pos + 6))
+            }
+            0x06 => {
+                let b = frame.get(pos + 2..pos + 18).context("truncated UDP IPv6")?;
+                let arr: [u8; 16] = b.try_into().expect("slice len checked");
+                Ok((Ipv6Addr::from(arr).to_string(), pos + 18))
+            }
+            t => bail!("bad UDP IP type {t:#04x}"),
+        }
+    } else {
+        // Domain: `first` is the length.
+        let len = first as usize;
+        let start = pos + 1;
+        let d = frame
+            .get(start..start + len)
+            .context("truncated UDP domain")?;
+        let host = std::str::from_utf8(d)
+            .context("non-UTF-8 UDP domain")?
+            .to_owned();
+        Ok((host, start + len))
+    }
+}
+
+/// Encode a client→server UoT frame from a SOCKS5 target. An IP-literal `host`
+/// is sent as a typed IP; anything else is sent as a length-prefixed domain
+/// (caller must ensure ≤255 bytes — SOCKS5 domains always are).
+pub fn encode_udp_request(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 1 + host.len() + 2 + payload.len());
+    out.push(UDP_FORWARD);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            out.extend_from_slice(&[0x00, 0x04]);
+            out.extend_from_slice(&v4.octets());
+        }
+        Ok(IpAddr::V6(v6)) => {
+            out.extend_from_slice(&[0x00, 0x06]);
+            out.extend_from_slice(&v6.octets());
+        }
+        Err(_) => {
+            out.push(host.len() as u8);
+            out.extend_from_slice(host.as_bytes());
+        }
+    }
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Encode a server→client UoT frame: `[atyp][addr][port BE][payload]` with the
+/// reply's source address prepended so the client can demultiplex.
+pub fn encode_udp_response(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 2 + payload.len());
+    match src.ip() {
+        IpAddr::V4(v4) => {
+            out.push(0x04);
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(0x06);
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+    out.extend_from_slice(&src.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Parse a server→client UoT frame, returning `(source_addr, payload)`.
+pub fn parse_udp_response(frame: &[u8]) -> Result<(SocketAddr, &[u8])> {
+    let (ip, mut pos): (IpAddr, usize) = match *frame.first().context("empty UDP response")? {
+        0x04 => {
+            let b = frame.get(1..5).context("truncated UDP IPv4 response")?;
+            (IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])), 5)
+        }
+        0x06 => {
+            let b = frame.get(1..17).context("truncated UDP IPv6 response")?;
+            let arr: [u8; 16] = b.try_into().expect("slice len checked");
+            (IpAddr::V6(Ipv6Addr::from(arr)), 17)
+        }
+        t => bail!("bad UDP response atyp {t:#04x}"),
+    };
+    let pb = frame
+        .get(pos..pos + 2)
+        .context("truncated UDP response port")?;
+    let port = u16::from_be_bytes([pb[0], pb[1]]);
+    pos += 2;
+    Ok((SocketAddr::new(ip, port), &frame[pos..]))
 }
 
 #[cfg(test)]
@@ -335,5 +472,99 @@ mod tests {
         let second = read_chunk(&mut rend, &mut rx).await.unwrap().unwrap();
         assert_eq!(first.len(), 0x3fff);
         assert_eq!(second.len(), 1);
+    }
+
+    // ---- UDP-over-TCP framing ------------------------------------------------
+
+    #[test]
+    fn udp_request_ipv4_byte_layout_and_roundtrip() {
+        // 1.2.3.4:53 with payload "hi" → 01 | 00 04 | 01020304 | 0035 | "hi"
+        let wire = encode_udp_request("1.2.3.4", 53, b"hi");
+        assert_eq!(wire, [0x01, 0x00, 0x04, 1, 2, 3, 4, 0x00, 0x35, b'h', b'i']);
+        let req = parse_udp_request(&wire).unwrap();
+        assert_eq!(req.host, "1.2.3.4");
+        assert_eq!(req.port, 53);
+        assert_eq!(req.payload, b"hi");
+    }
+
+    #[test]
+    fn udp_request_ipv6_roundtrip() {
+        let wire = encode_udp_request("2606:4700:4700::1111", 443, b"x");
+        assert_eq!(wire[0], 0x01);
+        assert_eq!(&wire[1..3], &[0x00, 0x06]);
+        let req = parse_udp_request(&wire).unwrap();
+        assert_eq!(
+            req.host,
+            "2606:4700:4700::1111"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(req.port, 443);
+        assert_eq!(req.payload, b"x");
+    }
+
+    #[test]
+    fn udp_request_domain_byte_layout_and_roundtrip() {
+        // example.com:443 → 01 | 0B | "example.com" | 01BB | "P"
+        let wire = encode_udp_request("example.com", 443, b"P");
+        assert_eq!(wire[0], 0x01);
+        assert_eq!(wire[1], 11);
+        assert_eq!(&wire[2..13], b"example.com");
+        assert_eq!(&wire[13..15], &[0x01, 0xbb]);
+        let req = parse_udp_request(&wire).unwrap();
+        assert_eq!(req.host, "example.com");
+        assert_eq!(req.port, 443);
+        assert_eq!(req.payload, b"P");
+    }
+
+    #[test]
+    fn udp_request_rejects_bad_opcode() {
+        assert!(parse_udp_request(&[0x06, 0x00, 0x04, 1, 2, 3, 4, 0, 53]).is_err());
+        assert!(parse_udp_request(&[]).is_err());
+    }
+
+    #[test]
+    fn udp_request_rejects_truncation() {
+        // opcode + IPv4 marker but only 3 of 4 addr bytes, no port
+        assert!(parse_udp_request(&[0x01, 0x00, 0x04, 1, 2, 3]).is_err());
+        // domain len=10 but short
+        assert!(parse_udp_request(&[0x01, 10, b'a', b'b']).is_err());
+        // addr ok but missing port
+        assert!(parse_udp_request(&[0x01, 0x00, 0x04, 1, 2, 3, 4]).is_err());
+    }
+
+    #[test]
+    fn udp_request_rejects_bad_ip_type() {
+        assert!(parse_udp_request(&[0x01, 0x00, 0x09, 1, 2, 3, 4, 0, 53]).is_err());
+    }
+
+    #[test]
+    fn udp_response_ipv4_byte_layout_and_roundtrip() {
+        let src: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let wire = encode_udp_response(src, b"pong");
+        // 04 | 08080808 | 0035 | "pong" — note: bare atyp, no 0x00 escape, no opcode
+        assert_eq!(wire, [0x04, 8, 8, 8, 8, 0x00, 0x35, b'p', b'o', b'n', b'g']);
+        let (got_src, payload) = parse_udp_response(&wire).unwrap();
+        assert_eq!(got_src, src);
+        assert_eq!(payload, b"pong");
+    }
+
+    #[test]
+    fn udp_response_ipv6_roundtrip() {
+        let src: SocketAddr = "[2001:4860:4860::8888]:443".parse().unwrap();
+        let wire = encode_udp_response(src, b"z");
+        assert_eq!(wire[0], 0x06);
+        let (got_src, payload) = parse_udp_response(&wire).unwrap();
+        assert_eq!(got_src, src);
+        assert_eq!(payload, b"z");
+    }
+
+    #[test]
+    fn udp_response_rejects_bad_atyp_and_truncation() {
+        assert!(parse_udp_response(&[0x01, 1, 2, 3, 4, 0, 53]).is_err()); // 0x01 not a UoT resp atyp
+        assert!(parse_udp_response(&[]).is_err());
+        assert!(parse_udp_response(&[0x04, 1, 2, 3]).is_err()); // short IPv4
+        assert!(parse_udp_response(&[0x04, 1, 2, 3, 4]).is_err()); // missing port
     }
 }

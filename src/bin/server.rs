@@ -40,8 +40,8 @@ use snell::relay::copy_t2c_adaptive;
 use snell::resolver::Resolver;
 use snell::salt_cache::SaltCache;
 use snell::snell::{
-    CMD_CONNECT, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL, parse_request,
-    read_chunk,
+    CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL,
+    parse_request, read_chunk, write_chunk,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -766,6 +766,13 @@ where
             continue;
         }
 
+        // ── UDP-over-TCP ──────────────────────────────────────────────────────
+        // Consumes the connection (no v5 reuse for UDP sessions).
+        if req.command == CMD_CONNECT_UDP {
+            tracing::debug!("CONNECT_UDP");
+            return relay_udp(conn, c2s, s2c, req.trailing, iface, block_private, resolver).await;
+        }
+
         // ── Normal TCP CONNECT ────────────────────────────────────────────────
         if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
             bail!("unknown command {:#04x}", req.command);
@@ -838,6 +845,99 @@ where
     }
 
     Ok(())
+}
+
+/// Relay a Snell UDP-over-TCP session. Consumes the connection (no v5 reuse for
+/// UDP). The handshake is done; `c2s`/`s2c` are the live ciphers and `trailing`
+/// is any datagram bundled with the request chunk. One datagram = one chunk.
+async fn relay_udp<S>(
+    mut conn: S,
+    mut c2s: SnellCipher,
+    mut s2c: SnellCipher,
+    trailing: Vec<u8>,
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    conn.write_all(&s2c.seal(&[RESP_TUNNEL])?).await?;
+
+    let sock = Arc::new(snell::egress::bind_udp(
+        "0.0.0.0:0".parse().expect("static"),
+        iface,
+    )?);
+
+    // The first datagram may be bundled with the handshake chunk.
+    if !trailing.is_empty() {
+        forward_udp_frame(&trailing, &sock, block_private, resolver).await;
+    }
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let up_sock = sock.clone();
+
+    // tunnel → target: each inbound chunk is one datagram frame.
+    let up = async move {
+        while let Some(frame) = read_chunk(&mut cr, &mut c2s).await? {
+            forward_udp_frame(&frame, &up_sock, block_private, resolver).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // target → tunnel: one datagram → one chunk, source address prepended.
+    let down = async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = sock.recv_from(&mut buf).await?;
+            let frame = snell::snell::encode_udp_response(src, &buf[..n]);
+            write_chunk(&mut cw, &mut s2c, &frame).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // The session ends when the tunnel closes (up returns) or either errors.
+    tokio::select! {
+        r = up => r,
+        r = down => r,
+    }
+}
+
+/// Decode one UoT datagram frame, resolve + SSRF-check the target, and forward
+/// the payload out the egress socket. A single malformed/blocked datagram is
+/// logged and dropped — it must not tear down the session.
+async fn forward_udp_frame(
+    frame: &[u8],
+    sock: &tokio::net::UdpSocket,
+    block_private: bool,
+    resolver: &Resolver,
+) {
+    let req = match snell::snell::parse_udp_request(frame) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping malformed UDP frame");
+            return;
+        }
+    };
+    let target = match resolver.resolve(&req.host, req.port).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            tracing::warn!(host = %req.host, "UDP target unresolved");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(host = %req.host, error = %e, "UDP resolve failed");
+            return;
+        }
+    };
+    if !is_safe_target(&target, block_private) {
+        tracing::warn!(%target, "UDP SSRF blocked");
+        return;
+    }
+    if let Err(e) = sock.send_to(req.payload, target).await {
+        tracing::warn!(%target, error = %e, "UDP send failed");
+    }
 }
 
 #[cfg(test)]
