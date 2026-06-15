@@ -185,4 +185,55 @@ mod tests {
         assert!(build_custom("1.1.1.1, 8.8.8.8", false).is_ok());
         assert!(build_custom("2606:4700:4700::1111", true).is_ok());
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_ipv4_literal_short_circuits() {
+        // SAFETY: serialized; DNS unset selects the System backend.
+        unsafe {
+            std::env::remove_var("DNS");
+        }
+        let r = Resolver::from_env(false).unwrap();
+        assert_eq!(
+            r.resolve("127.0.0.1", 80).await.unwrap(),
+            Some("127.0.0.1:80".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_ipv6_literal_filtered_when_ipv6_off() {
+        // SAFETY: serialized.
+        unsafe {
+            std::env::remove_var("DNS");
+        }
+        let r = Resolver::from_env(false).unwrap();
+        assert_eq!(r.resolve("::1", 80).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_system_localhost_yields_ipv4() {
+        // SAFETY: serialized.
+        unsafe {
+            std::env::remove_var("DNS");
+        }
+        let r = Resolver::from_env(false).unwrap();
+        let a = r.resolve("localhost", 80).await.unwrap();
+        assert!(a.is_some_and(|s| s.ip().is_ipv4()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_builds_custom_backend_when_dns_set() {
+        // SAFETY: serialized.
+        unsafe {
+            std::env::set_var("DNS", "1.1.1.1,8.8.8.8");
+        }
+        let r = Resolver::from_env(false);
+        unsafe {
+            std::env::remove_var("DNS");
+        }
+        assert!(r.is_ok());
+    }
 }

@@ -399,3 +399,72 @@ async fn forward_to_app(
     pkt.extend_from_slice(payload);
     let _ = udp.send_to(&pkt, dst).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_socks5_udp_ipv4() {
+        let buf = [0, 0, 0, 0x01, 1, 2, 3, 4, 0, 53, b'h', b'i'];
+        let (host, port, data) = parse_socks5_udp(&buf).unwrap();
+        assert_eq!(host, "1.2.3.4");
+        assert_eq!(port, 53);
+        assert_eq!(data, b"hi");
+    }
+
+    #[test]
+    fn parse_socks5_udp_domain() {
+        let mut buf = vec![0, 0, 0, 0x03, 11];
+        buf.extend_from_slice(b"example.com");
+        buf.extend_from_slice(&[0x01, 0xbb, b'x']);
+        let (host, port, data) = parse_socks5_udp(&buf).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(data, b"x");
+    }
+
+    #[test]
+    fn parse_socks5_udp_ipv6() {
+        let mut buf = vec![0, 0, 0, 0x04];
+        buf.extend_from_slice(&[0u8; 16]); // ::
+        buf.extend_from_slice(&[0, 80, b'z']);
+        let (host, port, data) = parse_socks5_udp(&buf).unwrap();
+        assert_eq!(host, "::");
+        assert_eq!(port, 80);
+        assert_eq!(data, b"z");
+    }
+
+    #[test]
+    fn parse_socks5_udp_rejects_fragments_and_malformed() {
+        assert!(parse_socks5_udp(&[0, 0, 1, 0x01, 1, 2, 3, 4, 0, 53]).is_none()); // FRAG != 0
+        assert!(parse_socks5_udp(&[0, 0, 0]).is_none()); // too short
+        assert!(parse_socks5_udp(&[0, 0, 0, 0x09, 1, 2]).is_none()); // bad ATYP
+        assert!(parse_socks5_udp(&[0, 0, 0, 0x01, 1, 2, 3, 4]).is_none()); // missing port
+    }
+
+    #[tokio::test]
+    async fn forward_to_app_drops_when_no_addr_learned() {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let frame = snell::snell::encode_udp_response("8.8.8.8:53".parse().unwrap(), b"x");
+        // No learned client addr → silently dropped (must not panic).
+        forward_to_app(&frame, &udp, &addr).await;
+    }
+
+    #[tokio::test]
+    async fn forward_to_app_wraps_ipv6_response_in_socks5() {
+        let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr: Arc<Mutex<Option<SocketAddr>>> =
+            Arc::new(Mutex::new(Some(app.local_addr().unwrap())));
+        let frame =
+            snell::snell::encode_udp_response("[2001:db8::1]:443".parse().unwrap(), b"pong");
+        forward_to_app(&frame, &relay, &addr).await;
+        let mut buf = [0u8; 64];
+        let n = app.recv_from(&mut buf).await.unwrap().0;
+        // [RSV 00 00][FRAG 00][ATYP 04 = IPv6] … payload at the tail.
+        assert_eq!(&buf[..4], &[0, 0, 0, 0x04]);
+        assert_eq!(&buf[n - 4..n], b"pong");
+    }
+}
