@@ -65,3 +65,60 @@ pub fn into_udp_socket(fd: RawFd) -> Result<tokio::net::UdpSocket> {
 pub fn take_listener_fds() -> Vec<i32> {
     vec![]
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::os::unix::io::IntoRawFd;
+
+    #[test]
+    #[serial]
+    fn take_listener_fds_returns_numbered_fds_when_pid_matches() {
+        // SAFETY: serialized test; no other threads read these env vars here.
+        unsafe {
+            std::env::set_var("LISTEN_PID", std::process::id().to_string());
+            std::env::set_var("LISTEN_FDS", "2");
+        }
+        assert_eq!(take_listener_fds(), vec![3, 4]);
+        // Vars are cleared after reading, per the sd_listen_fds spec.
+        assert!(std::env::var("LISTEN_PID").is_err());
+        assert!(std::env::var("LISTEN_FDS").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn take_listener_fds_empty_when_pid_mismatches() {
+        // SAFETY: serialized test.
+        unsafe {
+            std::env::set_var("LISTEN_PID", "1");
+            std::env::set_var("LISTEN_FDS", "3");
+        }
+        assert!(take_listener_fds().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn take_listener_fds_empty_when_unset() {
+        // SAFETY: serialized test.
+        unsafe {
+            std::env::remove_var("LISTEN_PID");
+            std::env::remove_var("LISTEN_FDS");
+        }
+        assert!(take_listener_fds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn into_tcp_listener_adopts_a_bound_socket() {
+        let std_ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ln = into_tcp_listener(std_ln.into_raw_fd()).unwrap();
+        assert!(ln.local_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn into_udp_socket_adopts_a_bound_socket() {
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = into_udp_socket(std_sock.into_raw_fd()).unwrap();
+        assert!(sock.local_addr().is_ok());
+    }
+}

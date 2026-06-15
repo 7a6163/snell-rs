@@ -1172,4 +1172,22 @@ mod tests {
 
     // Egress address-family selection now lives in `snell::resolver`; its
     // pick_addr/build_custom unit tests are in src/resolver.rs.
+
+    #[tokio::test]
+    async fn forward_udp_frame_drops_malformed_frame() {
+        let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let resolver = Resolver::from_env(false).unwrap();
+        // Bad opcode → parse error → dropped without panic or send.
+        forward_udp_frame(&[0xff, 0x00], &sock, false, &resolver).await;
+    }
+
+    #[tokio::test]
+    async fn forward_udp_frame_blocks_ssrf_target() {
+        let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let resolver = Resolver::from_env(false).unwrap();
+        // Private target + block_private=true → SSRF block branch. The IP literal
+        // resolves without DNS, so the backend choice is irrelevant here.
+        let frame = snell::snell::encode_udp_request("10.0.0.1", 53, b"x");
+        forward_udp_frame(&frame, &sock, true, &resolver).await;
+    }
 }
