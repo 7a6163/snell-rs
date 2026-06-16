@@ -16,11 +16,15 @@
 //! live official server.
 
 mod frame;
+mod mode;
 mod profile;
 mod record;
+pub mod unsafe_raw;
 
+pub use mode::Mode;
 pub use profile::Profile;
 pub use record::seal_record;
+pub use unsafe_raw::{decode_unsafe_raw, encode_unsafe_raw};
 
 #[cfg(test)]
 mod vectors;
