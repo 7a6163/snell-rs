@@ -4,6 +4,7 @@ pub mod egress;
 pub mod logging;
 pub mod quic;
 pub mod relay;
+pub mod resolver;
 pub mod salt_cache;
 pub mod snell;
 pub mod tfo;

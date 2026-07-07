@@ -5,6 +5,12 @@
 //! Environment variables:
 //!   PSK                   Pre-shared key (required, min 16 chars)
 //!   EGRESS_INTERFACE      Bind outgoing connections to this network interface
+//!   IPV6=1                Allow IPv6 outbound targets. Default off (IPv4-only
+//!                         egress), matching official snell-server `ipv6=false`:
+//!                         AAAA results are skipped unless this is set.
+//!   DNS                   Comma-separated upstream DNS server IPs for resolving
+//!                         target hostnames (e.g. DNS=1.1.1.1,8.8.8.8). Queried
+//!                         over UDP+TCP port 53. Unset = system resolver.
 //!   QUIC=1                Enable QUIC proxy mode (opens UDP on same port)
 //!   BLOCK_PRIVATE_TARGETS=1  Refuse to proxy to loopback/private/reserved addresses
 //!                            (default: allow — proxying to LAN is a legit use case)
@@ -31,10 +37,11 @@ use anyhow::{Result, bail};
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::quic::{SessionTable, UdpSession, gc_sessions, new_session_table};
 use snell::relay::copy_t2c_adaptive;
+use snell::resolver::Resolver;
 use snell::salt_cache::SaltCache;
 use snell::snell::{
-    CMD_CONNECT, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL, parse_request,
-    read_chunk,
+    CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL,
+    parse_request, read_chunk, write_chunk,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -145,6 +152,14 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let block_private = std::env::var("BLOCK_PRIVATE_TARGETS")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // IPv6 egress toggle. Default false (IPv4-only outbound) to match official
+    // snell-server's `ipv6=false`: AAAA results are skipped unless explicitly
+    // enabled. Set IPV6=1 to allow IPv6 targets.
+    let ipv6 = std::env::var("IPV6").map(|v| v == "1").unwrap_or(false);
+    // Outbound DNS resolver. Defaults to the system resolver; when DNS lists
+    // upstream IPs (e.g. DNS=1.1.1.1,8.8.8.8) a hickory resolver is built. The
+    // IPv6 toggle is folded in so all resolution honors it uniformly.
+    let resolver = Arc::new(Resolver::from_env(ipv6)?);
     // TCP_FASTOPEN defaults to on (matches official snell-server).
     // Explicitly set TCP_FASTOPEN=0 to disable. Anything else (including unset
     // or "1") leaves it enabled. The effective state still requires the kernel
@@ -200,6 +215,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                     psk.clone(),
                     egress_iface.clone(),
                     block_private,
+                    resolver.clone(),
                     init_cooldown.clone(),
                     salt_cache.clone(),
                 );
@@ -220,6 +236,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 psk.clone(),
                 egress_iface.clone(),
                 block_private,
+                resolver.clone(),
                 init_cooldown.clone(),
                 salt_cache.clone(),
             );
@@ -281,6 +298,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         let psk = psk.clone();
         let tls_acceptor = tls_acceptor.clone();
         let iface = egress_iface.clone();
+        let resolver = resolver.clone();
         let salt_cache_per_conn = salt_cache.clone();
         tokio::spawn(async move {
             let _permit = permit; // released on drop
@@ -290,6 +308,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 &tls_acceptor,
                 iface.as_deref().map(String::as_str),
                 block_private,
+                &resolver,
                 tfo_out,
                 &salt_cache_per_conn,
             )
@@ -364,12 +383,14 @@ fn apply_listen_tfo(_ln: &TcpListener) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_udp_listener(
     sock: tokio::net::UdpSocket,
     table: SessionTable,
     psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
+    resolver: Arc<Resolver>,
     init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) {
@@ -381,6 +402,7 @@ fn spawn_udp_listener(
             psk,
             iface,
             block_private,
+            resolver,
             init_cooldown,
             salt_cache,
         )
@@ -434,12 +456,14 @@ fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
 }
 
 /// UDP relay loop: classify datagrams by byte[0] and route by source sockaddr.
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_relay(
     sock: Arc<tokio::net::UdpSocket>,
     table: SessionTable,
     psk: Psk,
     iface: Option<Arc<String>>,
     block_private: bool,
+    resolver: Arc<Resolver>,
     init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) -> Result<()> {
@@ -478,6 +502,7 @@ async fn run_udp_relay(
                     &psk,
                     iface.as_deref().map(String::as_str),
                     block_private,
+                    &resolver,
                     &init_cooldown,
                     &salt_cache,
                 )
@@ -496,6 +521,7 @@ async fn handle_quic_init(
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
+    resolver: &Resolver,
     init_cooldown: &IpCooldownMap,
     salt_cache: &SaltCache,
 ) {
@@ -537,15 +563,10 @@ async fn handle_quic_init(
     tracing::debug!(%src, host = %req.host, port = req.port, "QUIC CONNECT_UDP");
 
     // Resolve and SSRF-check
-    let target_addr: SocketAddr =
-        match tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
-            .await
-            .ok()
-            .and_then(|mut it| it.next())
-        {
-            Some(a) => a,
-            None => return,
-        };
+    let target_addr: SocketAddr = match resolver.resolve(&req.host, req.port).await {
+        Ok(Some(a)) => a,
+        Ok(None) | Err(_) => return,
+    };
     if !is_safe_target(&target_addr, block_private) {
         tracing::warn!(%target_addr, "QUIC SSRF blocked");
         return;
@@ -598,12 +619,14 @@ async fn handle_quic_init(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     mut conn: TcpStream,
     psk: &[u8],
     tls: &TlsAcceptor,
     iface: Option<&str>,
     block_private: bool,
+    resolver: &Resolver,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
@@ -623,7 +646,16 @@ async fn dispatch(
             let stream = tokio::time::timeout(obfs_budget, tls.accept(conn))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS accept timeout"))??;
-            handle(stream, psk, iface, block_private, tfo_out, salt_cache).await
+            handle(
+                stream,
+                psk,
+                iface,
+                block_private,
+                resolver,
+                tfo_out,
+                salt_cache,
+            )
+            .await
         }
         b'G' => {
             tokio::time::timeout(obfs_budget, absorb_http_request(&mut conn))
@@ -635,9 +667,29 @@ async fn dispatch(
                   Connection: Upgrade\r\n\r\n",
             )
             .await?;
-            handle(conn, psk, iface, block_private, tfo_out, salt_cache).await
+            handle(
+                conn,
+                psk,
+                iface,
+                block_private,
+                resolver,
+                tfo_out,
+                salt_cache,
+            )
+            .await
         }
-        _ => handle(conn, psk, iface, block_private, tfo_out, salt_cache).await,
+        _ => {
+            handle(
+                conn,
+                psk,
+                iface,
+                block_private,
+                resolver,
+                tfo_out,
+                salt_cache,
+            )
+            .await
+        }
     }
 }
 
@@ -671,11 +723,13 @@ async fn absorb_http_request(conn: &mut TcpStream) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle<S>(
     mut conn: S,
     psk: &[u8],
     iface: Option<&str>,
     block_private: bool,
+    resolver: &Resolver,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()>
@@ -712,6 +766,13 @@ where
             continue;
         }
 
+        // ── UDP-over-TCP ──────────────────────────────────────────────────────
+        // Consumes the connection (no v5 reuse for UDP sessions).
+        if req.command == CMD_CONNECT_UDP {
+            tracing::debug!("CONNECT_UDP");
+            return relay_udp(conn, c2s, s2c, req.trailing, iface, block_private, resolver).await;
+        }
+
         // ── Normal TCP CONNECT ────────────────────────────────────────────────
         if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
             bail!("unknown command {:#04x}", req.command);
@@ -719,9 +780,9 @@ where
 
         tracing::debug!(host = %req.host, port = req.port, "CONNECT");
 
-        let target_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", req.host, req.port))
+        let target_addr: SocketAddr = resolver
+            .resolve(&req.host, req.port)
             .await?
-            .next()
             .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
 
         if !is_safe_target(&target_addr, block_private) {
@@ -784,6 +845,99 @@ where
     }
 
     Ok(())
+}
+
+/// Relay a Snell UDP-over-TCP session. Consumes the connection (no v5 reuse for
+/// UDP). The handshake is done; `c2s`/`s2c` are the live ciphers and `trailing`
+/// is any datagram bundled with the request chunk. One datagram = one chunk.
+async fn relay_udp<S>(
+    mut conn: S,
+    mut c2s: SnellCipher,
+    mut s2c: SnellCipher,
+    trailing: Vec<u8>,
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    conn.write_all(&s2c.seal(&[RESP_TUNNEL])?).await?;
+
+    let sock = Arc::new(snell::egress::bind_udp(
+        "0.0.0.0:0".parse().expect("static"),
+        iface,
+    )?);
+
+    // The first datagram may be bundled with the handshake chunk.
+    if !trailing.is_empty() {
+        forward_udp_frame(&trailing, &sock, block_private, resolver).await;
+    }
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let up_sock = sock.clone();
+
+    // tunnel → target: each inbound chunk is one datagram frame.
+    let up = async move {
+        while let Some(frame) = read_chunk(&mut cr, &mut c2s).await? {
+            forward_udp_frame(&frame, &up_sock, block_private, resolver).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // target → tunnel: one datagram → one chunk, source address prepended.
+    let down = async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = sock.recv_from(&mut buf).await?;
+            let frame = snell::snell::encode_udp_response(src, &buf[..n]);
+            write_chunk(&mut cw, &mut s2c, &frame).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // The session ends when the tunnel closes (up returns) or either errors.
+    tokio::select! {
+        r = up => r,
+        r = down => r,
+    }
+}
+
+/// Decode one UoT datagram frame, resolve + SSRF-check the target, and forward
+/// the payload out the egress socket. A single malformed/blocked datagram is
+/// logged and dropped — it must not tear down the session.
+async fn forward_udp_frame(
+    frame: &[u8],
+    sock: &tokio::net::UdpSocket,
+    block_private: bool,
+    resolver: &Resolver,
+) {
+    let req = match snell::snell::parse_udp_request(frame) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping malformed UDP frame");
+            return;
+        }
+    };
+    let target = match resolver.resolve(&req.host, req.port).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            tracing::warn!(host = %req.host, "UDP target unresolved");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(host = %req.host, error = %e, "UDP resolve failed");
+            return;
+        }
+    };
+    if !is_safe_target(&target, block_private) {
+        tracing::warn!(%target, "UDP SSRF blocked");
+        return;
+    }
+    if let Err(e) = sock.send_to(req.payload, target).await {
+        tracing::warn!(%target, error = %e, "UDP send failed");
+    }
 }
 
 #[cfg(test)]
@@ -1014,5 +1168,26 @@ mod tests {
     fn accepts_public_ipv6() {
         assert!(is_safe_target(&v6("2606:4700:4700::1111"), true));
         assert!(is_safe_target(&v6("2001:4860:4860::8888"), true));
+    }
+
+    // Egress address-family selection now lives in `snell::resolver`; its
+    // pick_addr/build_custom unit tests are in src/resolver.rs.
+
+    #[tokio::test]
+    async fn forward_udp_frame_drops_malformed_frame() {
+        let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let resolver = Resolver::from_env(false).unwrap();
+        // Bad opcode → parse error → dropped without panic or send.
+        forward_udp_frame(&[0xff, 0x00], &sock, false, &resolver).await;
+    }
+
+    #[tokio::test]
+    async fn forward_udp_frame_blocks_ssrf_target() {
+        let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let resolver = Resolver::from_env(false).unwrap();
+        // Private target + block_private=true → SSRF block branch. The IP literal
+        // resolves without DNS, so the backend choice is irrelevant here.
+        let frame = snell::snell::encode_udp_request("10.0.0.1", 53, b"x");
+        forward_udp_frame(&frame, &sock, true, &resolver).await;
     }
 }
