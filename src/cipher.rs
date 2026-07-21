@@ -104,11 +104,18 @@ impl SnellCipher {
 
     /// Zero chunk — signals end of a multiplexed session.
     pub fn seal_zero(&mut self) -> Result<Vec<u8>> {
+        self.seal_zero_with_aad(&[])
+    }
+
+    /// Like [`seal_zero`](Self::seal_zero) but authenticates the header against
+    /// `header_aad`. v6 `default` mode passes the per-chunk prefix so the
+    /// session-terminating zero record matches the prefixed-record layout.
+    pub fn seal_zero_with_aad(&mut self, header_aad: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(HDR_CT_LEN);
         out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, 0, 0]);
         let tag = self
             .aead
-            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], &mut out[..7])
+            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), header_aad, &mut out[..7])
             .map_err(|_| anyhow::anyhow!("zero-chunk AEAD encrypt"))?;
         out.extend_from_slice(&tag);
         self.inc();

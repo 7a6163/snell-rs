@@ -16,11 +16,16 @@
 //! live official server.
 
 mod frame;
+pub mod io;
 mod mode;
 mod profile;
 mod record;
 pub mod unsafe_raw;
 
+pub use io::{
+    read_record, read_unsafe_raw, write_records, write_unsafe_raw, write_unsafe_raw_zero,
+    write_zero_record,
+};
 pub use mode::Mode;
 pub use profile::Profile;
 pub use record::seal_record;

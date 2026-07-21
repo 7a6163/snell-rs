@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0-rc.1] - 2026-07-21
+
+### Added
+
+- **v6 encryption modes** (`MODE`): the server and client now speak all three
+  official snell-server v6 modes, selected out-of-band and validated
+  byte-exact against the v6.0.0rc-1 binaries (amd64 / i386 / aarch64).
+  - `default` (shaped) — the 16-byte session salt is scattered into a
+    PSK-sized first frame at PSK-derived permuted positions, each XORed with a
+    PSK-derived keystream; every AEAD chunk is preceded by a PSK-derived prefix
+    that doubles as the header AEAD AAD. Surge's default mode; DPI-resistant.
+  - `unshaped` — raw 16-byte salt + v5 AEAD chunks with an empty header AAD.
+    Byte-identical to the v5 wire this crate has always spoken, so it remains
+    the default when `MODE` is unset (existing v5 deployments are unaffected).
+  - `unsafe-raw` — plaintext 5-byte-header framing: no salt, KDF, or cipher.
+    Only for use behind an already-secure outer channel.
+  The crypto (argon2id KDF, AES-128-GCM, 12-byte LE counter nonce) is unchanged
+  from v5 across all three modes. See `src/v6/` and `tests/v6_test_vectors.json`.
+- `MODE` env var on both `snell-server` and `snell-client` (must match; not
+  negotiated on the wire).
+
+### Changed
+
+- Crate version bumped to `6.0.0-rc.1`; description now "Open-source Snell
+  v5/v6 proxy protocol implementation".
+- The server startup banner and client banner report the active mode.
+- `v6` module is now wired into both binaries (previously a standalone,
+  byte-verified library not reachable from the running server/client).
+
+### Notes
+
+- `obfs=http` / `obfs=tls` auto-detect and UDP-over-TCP relay continue to apply
+  only on the `unshaped` (v5) wire. `default` and `unsafe-raw` cover TCP CONNECT.
+- rc-1's TCP CONNECT wire format is identical to v6.0.0b4; the `src/v6/`
+  golden vectors remain a valid oracle.
+
 ## [5.6.0] - 2026-06-15
 
 ### Added
@@ -107,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - End-to-end integration tests for TCP and QUIC; CI with static musl binaries and
   a multi-arch Docker image.
 
+[6.0.0-rc.1]: https://github.com/7a6163/snell-rs/compare/v5.6.0...v6.0.0-rc.1
 [5.6.0]: https://github.com/7a6163/snell-rs/compare/v5.5.0...v5.6.0
 [5.5.0]: https://github.com/7a6163/snell-rs/compare/v5.4.0...v5.5.0
 [5.4.0]: https://github.com/7a6163/snell-rs/compare/v5.3.0...v5.4.0

@@ -104,6 +104,7 @@ fn seed(idx: u64, k64: u64, m: &[u64; 4]) -> u64 {
 }
 
 /// PSK-derived shaping profile. Cheap to derive; derive once per connection.
+#[derive(Clone)]
 pub struct Profile {
     seeds: [(u16, u64); 7],
 }

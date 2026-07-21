@@ -64,6 +64,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `PSK` | ✅ | — | Pre-shared key |
+| `MODE` | — | `unshaped` | v6 encryption mode: `default` (shaped), `unshaped` (v5 wire), or `unsafe-raw` (plaintext). Must match the client. See [v6 Encryption Modes](#v6-encryption-modes) |
 | `EGRESS_INTERFACE` | — | system default | Bind outgoing connections to this interface |
 | `IPV6` | — | `0` | Set to `1` to allow IPv6 outbound targets. Default off (IPv4-only egress), matching official snell-server `ipv6=false` |
 | `DNS` | — | system | Comma-separated upstream DNS server IPs for resolving target hostnames (e.g. `1.1.1.1,8.8.8.8`), queried over UDP+TCP port 53. Unset uses the system resolver |
@@ -85,6 +86,7 @@ PSK=your-key QUIC=1 EGRESS_INTERFACE=eth0 ./snell-server 0.0.0.0:6180
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `PSK` | ✅ | — | Must match the server's PSK |
+| `MODE` | — | `unshaped` | v6 encryption mode; must match the server. See [v6 Encryption Modes](#v6-encryption-modes) |
 | `SNELL_SERVER` | — | `127.0.0.1:6180` | Snell server `host:port` |
 | `LISTEN` | — | `127.0.0.1:1080` | Local SOCKS5 bind address |
 | `TCP_FASTOPEN` | — | `0` | Set to `1` to opt the outbound socket to the snell server into client-side TFO |
@@ -139,6 +141,32 @@ my-server = snell, your-server-ip, 6180, psk=your-key, version=5, obfs=http, obf
 # TLS obfuscation
 my-server = snell, your-server-ip, 6180, psk=your-key, version=5, obfs=tls, obfs-host=example.com
 ```
+
+## v6 Encryption Modes
+
+Set `MODE` on **both** the server and client (it is not negotiated on the wire; a
+mismatch silently fails to establish a tunnel). The three modes trade off
+detection-resistance against complexity:
+
+| `MODE` | Salt | KDF / cipher | Framing | Use |
+|---|---|---|---|---|
+| `default` | scattered in a PSK-sized first frame (permuted + XOR keystream) | argon2id + AES-128-GCM | per-chunk PSK-derived prefix (doubles as header AEAD AAD) | Surge default; DPI-resistant traffic shaping |
+| `unshaped` | raw 16 bytes | argon2id + AES-128-GCM | v5 chunks, empty header AAD | byte-identical to the v5 wire; the default when `MODE` is unset |
+| `unsafe-raw` | none | none (plaintext) | 5-byte plaintext header + plaintext payload | only behind an already-secure outer channel |
+
+The crypto (argon2id KDF, AES-128-GCM, 12-byte LE counter nonce) is identical
+across all three modes and unchanged from v5. The `default` shaping profile is
+derived deterministically from the PSK and was validated byte-exact against the
+official snell-server v6.0.0rc-1 binary (see `tests/v6_test_vectors.json`).
+
+```bash
+# Shaped (Surge-compatible) mode
+MODE=default PSK=your-key ./snell-server 0.0.0.0:6180
+MODE=default PSK=your-key SNELL_SERVER=... ./snell-client
+```
+
+> **Note:** obfs auto-detect (`obfs=http` / `obfs=tls`) and UDP-over-TCP relay
+> apply only in `unshaped` mode. `default` and `unsafe-raw` cover TCP CONNECT.
 
 ## UDP Relay over TCP
 

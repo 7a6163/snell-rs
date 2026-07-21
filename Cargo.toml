@@ -1,9 +1,9 @@
 [package]
 name = "snell-rs"
-version = "5.6.0"
+version = "6.0.0-rc.1"
 edition = "2024"
 rust-version = "1.95"
-description = "Open-source Snell v5 proxy protocol implementation"
+description = "Open-source Snell v5/v6 proxy protocol implementation"
 license = "MIT"
 
 [lib]

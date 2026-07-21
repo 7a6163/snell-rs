@@ -34,6 +34,7 @@
 //!   obfs=tls  — 0x16 (TLS ClientHello)
 
 use anyhow::{Result, bail};
+use rand::RngCore;
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::quic::{SessionTable, UdpSession, gc_sessions, new_session_table};
 use snell::relay::copy_t2c_adaptive;
@@ -42,6 +43,10 @@ use snell::salt_cache::SaltCache;
 use snell::snell::{
     CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL,
     parse_request, read_chunk, write_chunk,
+};
+use snell::v6::{
+    Mode, Profile, read_record, read_unsafe_raw, write_records, write_unsafe_raw,
+    write_unsafe_raw_zero, write_zero_record,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -180,6 +185,17 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         .and_then(|v| v.parse().ok())
         .unwrap_or(TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT);
 
+    // v6 encryption mode (out-of-band; client must match). Unset defaults to
+    // `unshaped`, which is byte-identical to the v5 wire this crate has always
+    // spoken — so existing v5 deployments are unaffected. `default` enables the
+    // v6 shaped handshake (scattered salt frame + per-chunk prefixed records);
+    // `unsafe-raw` is plaintext framing (no salt/KDF/cipher).
+    let mode = match std::env::var("MODE") {
+        Ok(s) => Mode::parse(&s)
+            .ok_or_else(|| anyhow::anyhow!("invalid MODE '{s}' (default|unshaped|unsafe-raw)"))?,
+        Err(_) => Mode::Unshaped,
+    };
+
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
     let session_table = new_session_table();
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS));
@@ -250,9 +266,13 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         false
     };
 
+    let mode_label = match mode {
+        Mode::Default => "v6/default (shaped)",
+        Mode::Unshaped => "v5 / v6-unshaped (plain / obfs=http / obfs=tls)",
+        Mode::UnsafeRaw => "v6/unsafe-raw (plaintext)",
+    };
     eprintln!(
-        "snell-server v5 listening on {listen}  \
-         (plain / obfs=http / obfs=tls{}{})",
+        "snell-server listening on {listen}  [{mode_label}]{}{}",
         if quic_enabled { " / QUIC" } else { "" },
         egress_iface
             .as_deref()
@@ -306,6 +326,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 conn,
                 &psk,
                 &tls_acceptor,
+                mode,
                 iface.as_deref().map(String::as_str),
                 block_private,
                 &resolver,
@@ -624,12 +645,34 @@ async fn dispatch(
     mut conn: TcpStream,
     psk: &[u8],
     tls: &TlsAcceptor,
+    mode: Mode,
     iface: Option<&str>,
     block_private: bool,
     resolver: &Resolver,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
+    // v6 modes bypass the v5 obfs auto-detect and go straight to their own
+    // handshake. `unshaped` is the v5 wire, so it keeps the obfs peek below.
+    match mode {
+        Mode::Default => {
+            return handle_v6_default(
+                conn,
+                psk,
+                iface,
+                block_private,
+                resolver,
+                tfo_out,
+                salt_cache,
+            )
+            .await;
+        }
+        Mode::UnsafeRaw => {
+            return handle_unsafe_raw(conn, iface, block_private, resolver, tfo_out).await;
+        }
+        Mode::Unshaped => {}
+    }
+
     // T2-F: each handshake phase has its own budget so a slow attacker can't
     // squat the full 30 s on a single phase. The relay loop inside handle()
     // is intentionally unbounded — only the handshake stages are timed.
@@ -844,6 +887,212 @@ where
         conn = cr.unsplit(cw);
     }
 
+    Ok(())
+}
+
+/// v6 `default` (shaped) TCP CONNECT handler. The client salt arrives scattered
+/// in a PSK-sized first frame; every subsequent chunk is a prefixed record whose
+/// prefix doubles as the header AEAD AAD. Single request per connection.
+async fn handle_v6_default(
+    mut conn: TcpStream,
+    psk: &[u8],
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+    tfo_out: bool,
+    salt_cache: &SaltCache,
+) -> Result<()> {
+    let profile = Profile::derive(psk);
+
+    // Handshake: recover the client salt from the scattered first frame.
+    let mut frame = vec![0u8; profile.frame_len()];
+    tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        conn.read_exact(&mut frame),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("v6 first-frame timeout"))??;
+    let client_salt = profile.decode_first_frame(&frame)?;
+
+    // CVE-3: reject replayed salts before the costly argon2id KDF runs.
+    if !salt_cache.check_and_insert(&client_salt) {
+        bail!("salt replay detected");
+    }
+    let mut c2s = SnellCipher::new(psk, &client_salt)?;
+    let mut c2s_k = 0u64;
+
+    // Reply with our own salt scattered into a symmetric first frame.
+    let (server_salt, mut s2c) = SnellCipher::with_random_salt(psk)?;
+    let mut filler = vec![0u8; profile.frame_len()];
+    rand::thread_rng().fill_bytes(&mut filler);
+    conn.write_all(&profile.encode_first_frame(&server_salt, Some(&filler))?)
+        .await?;
+    let mut s2c_k = 0u64;
+
+    // First record is the CONNECT request.
+    let Some(payload) = tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        read_record(&mut conn, &mut c2s, &profile, &mut c2s_k),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("v6 request timeout"))??
+    else {
+        return Ok(());
+    };
+    let req = parse_request(&payload)?;
+
+    if req.command == CMD_PING {
+        write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &[RESP_PONG]).await?;
+        return Ok(());
+    }
+    if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
+        bail!(
+            "command {:#04x} unsupported in v6/default (TCP CONNECT only)",
+            req.command
+        );
+    }
+    tracing::debug!(host = %req.host, port = req.port, "v6/default CONNECT");
+
+    let target_addr: SocketAddr = resolver
+        .resolve(&req.host, req.port)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
+    if !is_safe_target(&target_addr, block_private) {
+        tracing::warn!(resolved = %target_addr, "SSRF blocked CONNECT");
+        let mut r = vec![RESP_ERROR, 0u8, 9];
+        r.extend_from_slice(b"forbidden");
+        write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &r).await?;
+        return Ok(());
+    }
+
+    let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
+            let msg = b"connection failed";
+            let mut r = vec![RESP_ERROR, 0u8, msg.len() as u8];
+            r.extend_from_slice(msg);
+            write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &r).await?;
+            return Ok(());
+        }
+    };
+
+    write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &[RESP_TUNNEL]).await?;
+    if !req.trailing.is_empty() {
+        target.write_all(&req.trailing).await?;
+    }
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let (mut tr, mut tw) = tokio::io::split(target);
+    let profile_up = profile.clone();
+
+    let c2t = async move {
+        while let Some(d) = read_record(&mut cr, &mut c2s, &profile_up, &mut c2s_k).await? {
+            tw.write_all(&d).await?;
+        }
+        tw.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let t2c = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_records(&mut cw, &mut s2c, &profile, &mut s2c_k, &buf[..n]).await?;
+        }
+        write_zero_record(&mut cw, &mut s2c, &profile, &mut s2c_k).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(c2t, t2c)?;
+    Ok(())
+}
+
+/// v6 `unsafe-raw` (plaintext) TCP CONNECT handler: no salt, KDF, or cipher.
+/// Single request per connection.
+async fn handle_unsafe_raw(
+    mut conn: TcpStream,
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+    tfo_out: bool,
+) -> Result<()> {
+    let Some(payload) = tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        read_unsafe_raw(&mut conn),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("unsafe-raw request timeout"))??
+    else {
+        return Ok(());
+    };
+    let req = parse_request(&payload)?;
+
+    if req.command == CMD_PING {
+        write_unsafe_raw(&mut conn, &[RESP_PONG]).await?;
+        return Ok(());
+    }
+    if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
+        bail!(
+            "command {:#04x} unsupported in v6/unsafe-raw (TCP CONNECT only)",
+            req.command
+        );
+    }
+    tracing::debug!(host = %req.host, port = req.port, "v6/unsafe-raw CONNECT");
+
+    let target_addr: SocketAddr = resolver
+        .resolve(&req.host, req.port)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
+    if !is_safe_target(&target_addr, block_private) {
+        tracing::warn!(resolved = %target_addr, "SSRF blocked CONNECT");
+        let mut r = vec![RESP_ERROR, 0u8, 9];
+        r.extend_from_slice(b"forbidden");
+        write_unsafe_raw(&mut conn, &r).await?;
+        return Ok(());
+    }
+
+    let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
+            let msg = b"connection failed";
+            let mut r = vec![RESP_ERROR, 0u8, msg.len() as u8];
+            r.extend_from_slice(msg);
+            write_unsafe_raw(&mut conn, &r).await?;
+            return Ok(());
+        }
+    };
+
+    write_unsafe_raw(&mut conn, &[RESP_TUNNEL]).await?;
+    if !req.trailing.is_empty() {
+        target.write_all(&req.trailing).await?;
+    }
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let (mut tr, mut tw) = tokio::io::split(target);
+
+    let c2t = async move {
+        while let Some(d) = read_unsafe_raw(&mut cr).await? {
+            tw.write_all(&d).await?;
+        }
+        tw.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let t2c = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_unsafe_raw(&mut cw, &buf[..n]).await?;
+        }
+        write_unsafe_raw_zero(&mut cw).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(c2t, t2c)?;
     Ok(())
 }
 

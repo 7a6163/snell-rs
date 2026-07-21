@@ -10,8 +10,13 @@
 
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
+use rand::RngCore;
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::snell::{CMD_CONNECT_UDP, RESP_TUNNEL, read_chunk, write_chunk};
+use snell::v6::{
+    Mode, Profile, read_record, read_unsafe_raw, write_records, write_unsafe_raw,
+    write_unsafe_raw_zero, write_zero_record,
+};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -57,8 +62,21 @@ async fn main() -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
 
+    // v6 encryption mode (must match the server; not negotiated on the wire).
+    // Unset defaults to `unshaped`, the v5 wire this client has always spoken.
+    let mode = match std::env::var("MODE") {
+        Ok(s) => Mode::parse(&s)
+            .ok_or_else(|| anyhow::anyhow!("invalid MODE '{s}' (default|unshaped|unsafe-raw)"))?,
+        Err(_) => Mode::Unshaped,
+    };
+
     let ln = TcpListener::bind(listen).await?;
-    eprintln!("Snell v5 SOCKS5 proxy  {listen} → {server}");
+    let mode_label = match mode {
+        Mode::Default => "v6/default",
+        Mode::Unshaped => "v5 / v6-unshaped",
+        Mode::UnsafeRaw => "v6/unsafe-raw",
+    };
+    eprintln!("Snell SOCKS5 proxy  {listen} → {server}  [{mode_label}]");
     if tfo_out {
         eprintln!("<NOTIFY> TCP Fast Open enabled (outbound)");
     }
@@ -66,7 +84,7 @@ async fn main() -> Result<()> {
         let (conn, _) = ln.accept().await?;
         let psk = psk.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, server, &psk, tfo_out).await {
+            if let Err(e) = handle(conn, server, &psk, tfo_out, mode).await {
                 tracing::error!(error = %e, "client connection failed");
             }
         });
@@ -114,7 +132,13 @@ async fn connect_server(server: SocketAddr, tfo_out: bool) -> anyhow::Result<Tcp
     Ok(sock.connect(server).await?)
 }
 
-async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: bool) -> Result<()> {
+async fn handle(
+    mut local: TcpStream,
+    server: SocketAddr,
+    psk: &[u8],
+    tfo_out: bool,
+    mode: Mode,
+) -> Result<()> {
     // SOCKS5 greeting: VER(1) + NMETHODS(1) + METHODS(n)
     let mut greeting = [0u8; 2];
     local.read_exact(&mut greeting).await?;
@@ -166,8 +190,12 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
     };
 
     // UDP ASSOCIATE → Snell UoT bridge. The DST addr/port parsed above are the
-    // client's advertised source and are ignored (RFC 1928).
+    // client's advertised source and are ignored (RFC 1928). UDP-over-TCP rides
+    // the v5 tunnel only; v6 default/unsafe-raw cover TCP CONNECT.
     if socks_cmd == 0x03 {
+        if mode != Mode::Unshaped {
+            bail!("UDP ASSOCIATE is only supported in the unshaped mode");
+        }
         return udp_associate(local, server, psk, tfo_out).await;
     }
     if socks_cmd != 0x01 {
@@ -179,23 +207,37 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
 
-    // Connect to Snell server and perform handshake
-    let mut remote = connect_server(server, tfo_out).await?;
+    let remote = connect_server(server, tfo_out).await?;
+
+    // Snell CONNECT_V2 request (identical across modes):
+    // [ver=1][cmd=5][client_id_len=0][host_len][host][port BE]
+    let hb = host.as_bytes();
+    let mut request = vec![0x01u8, 0x05, 0x00, hb.len() as u8];
+    request.extend_from_slice(hb);
+    request.push((port >> 8) as u8);
+    request.push((port & 0xff) as u8);
+
+    match mode {
+        Mode::Unshaped => v5_tunnel(remote, psk, &request, local).await,
+        Mode::Default => v6_default_tunnel(remote, psk, &request, local).await,
+        Mode::UnsafeRaw => unsafe_raw_tunnel(remote, &request, local).await,
+    }
+}
+
+/// v5 / v6-unshaped tunnel: raw 16-byte salt + AEAD chunks (empty header AAD).
+async fn v5_tunnel(
+    mut remote: TcpStream,
+    psk: &[u8],
+    request: &[u8],
+    mut local: TcpStream,
+) -> Result<()> {
     let (salt, mut c2s) = fresh_handshake_salt(psk)?;
     remote.write_all(&salt).await?;
+    remote.write_all(&c2s.seal(request)?).await?;
 
-    // Snell v5 CONNECT_V2 request: [ver=1][cmd=5][client_id_len=0][host_len][host][port BE]
-    let hb = host.as_bytes();
-    let mut hs = vec![0x01u8, 0x05, 0x00, hb.len() as u8];
-    hs.extend_from_slice(hb);
-    hs.push((port >> 8) as u8);
-    hs.push((port & 0xff) as u8);
-    remote.write_all(&c2s.seal(&hs)?).await?;
-
-    // Official snell-server v5 doesn't send the server salt upfront — it
-    // waits for the target to produce data, then sends [server_salt][RESP_TUNNEL
-    // + target_data] together. So salt-reading must happen in the down task,
-    // concurrently with the up task that forwards local data to remote.
+    // Official snell-server doesn't send the server salt upfront — it waits for
+    // target data, then sends [server_salt][RESP_TUNNEL + data] together. So
+    // salt-reading happens in the down task, concurrently with the up task.
     let psk_arc = psk.to_vec();
     let (mut lr, mut lw) = local.split();
     let (mut rr, mut rw) = remote.split();
@@ -230,6 +272,110 @@ async fn handle(mut local: TcpStream, server: SocketAddr, psk: &[u8], tfo_out: b
                     }
                 }
                 Some(d) => lw.write_all(&d).await?,
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    tokio::try_join!(up, down)?;
+    Ok(())
+}
+
+/// v6 `default` tunnel: scattered-salt first frame + per-chunk prefixed records.
+async fn v6_default_tunnel(
+    mut remote: TcpStream,
+    psk: &[u8],
+    request: &[u8],
+    local: TcpStream,
+) -> Result<()> {
+    let profile = Profile::derive(psk);
+
+    // Scatter our salt into the first frame, then send the request record.
+    let (salt, mut c2s) = SnellCipher::with_random_salt(psk)?;
+    let mut filler = vec![0u8; profile.frame_len()];
+    rand::thread_rng().fill_bytes(&mut filler);
+    remote
+        .write_all(&profile.encode_first_frame(&salt, Some(&filler))?)
+        .await?;
+    let mut c2s_k = 0u64;
+    write_records(&mut remote, &mut c2s, &profile, &mut c2s_k, request).await?;
+
+    let (mut lr, mut lw) = local.into_split();
+    let (mut rr, mut rw) = remote.into_split();
+    let psk_arc = psk.to_vec();
+    let profile_dn = profile.clone();
+
+    let up = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = lr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_records(&mut rw, &mut c2s, &profile, &mut c2s_k, &buf[..n]).await?;
+        }
+        write_zero_record(&mut rw, &mut c2s, &profile, &mut c2s_k).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let down = async move {
+        let mut frame = vec![0u8; profile_dn.frame_len()];
+        rr.read_exact(&mut frame).await?;
+        let server_salt = profile_dn.decode_first_frame(&frame)?;
+        let mut s2c = SnellCipher::new(&psk_arc, &server_salt)?;
+        let mut s2c_k = 0u64;
+        let mut first = true;
+        while let Some(d) = read_record(&mut rr, &mut s2c, &profile_dn, &mut s2c_k).await? {
+            if first {
+                first = false;
+                if d.first() != Some(&RESP_TUNNEL) {
+                    bail!("expected ResponseTunnel, got {:?}", d.first());
+                }
+                if d.len() > 1 {
+                    lw.write_all(&d[1..]).await?;
+                }
+            } else {
+                lw.write_all(&d).await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    tokio::try_join!(up, down)?;
+    Ok(())
+}
+
+/// v6 `unsafe-raw` tunnel: plaintext frames, no salt/KDF/cipher.
+async fn unsafe_raw_tunnel(mut remote: TcpStream, request: &[u8], local: TcpStream) -> Result<()> {
+    write_unsafe_raw(&mut remote, request).await?;
+
+    let (mut lr, mut lw) = local.into_split();
+    let (mut rr, mut rw) = remote.into_split();
+
+    let up = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = lr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_unsafe_raw(&mut rw, &buf[..n]).await?;
+        }
+        write_unsafe_raw_zero(&mut rw).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let down = async move {
+        let mut first = true;
+        while let Some(d) = read_unsafe_raw(&mut rr).await? {
+            if first {
+                first = false;
+                if d.first() != Some(&RESP_TUNNEL) {
+                    bail!("expected ResponseTunnel, got {:?}", d.first());
+                }
+                if d.len() > 1 {
+                    lw.write_all(&d[1..]).await?;
+                }
+            } else {
+                lw.write_all(&d).await?;
             }
         }
         Ok::<_, anyhow::Error>(())
