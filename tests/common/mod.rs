@@ -5,7 +5,9 @@
 
 #![allow(dead_code)]
 
+use snell::cipher::{SALT_LEN, SnellCipher};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -35,6 +37,28 @@ pub async fn wait_tcp(port: u16) {
         sleep(Duration::from_millis(50)).await;
     }
     panic!("port {port} did not open within 5s");
+}
+
+/// Perform a plain Snell v5 handshake against the server and return the
+/// connection plus the (client→server, server→client) ciphers.
+pub async fn snell_handshake(server_port: u16) -> (TcpStream, SnellCipher, SnellCipher) {
+    let psk = PSK.as_bytes();
+    let mut conn = TcpStream::connect(("127.0.0.1", server_port))
+        .await
+        .unwrap();
+    // First byte must avoid the obfs auto-detect (0x16 = TLS, 'G' = HTTP).
+    let mut salt = [0u8; SALT_LEN];
+    salt[0] = 0x01;
+    for b in salt.iter_mut().skip(1) {
+        *b = rand::random();
+    }
+    let c2s = SnellCipher::new(psk, &salt).unwrap();
+    conn.write_all(&salt).await.unwrap();
+    // The server sends its salt up front, before reading the request.
+    let mut server_salt = [0u8; SALT_LEN];
+    conn.read_exact(&mut server_salt).await.unwrap();
+    let s2c = SnellCipher::new(psk, &server_salt).unwrap();
+    (conn, c2s, s2c)
 }
 
 pub struct ChildGuard(pub Child);

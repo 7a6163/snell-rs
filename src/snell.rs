@@ -13,6 +13,101 @@ pub const RESP_TUNNEL: u8 = 0x00;
 pub const RESP_PONG: u8 = 0x01;
 pub const RESP_ERROR: u8 = 0x02;
 
+/// Error codes carried in the second byte of a `RESP_ERROR` frame. Values match
+/// official snell-server v6.0.0rc2, whose `connect()` failure table is indexed
+/// by `-errno`. [`errcode::FORBIDDEN`] is a snell-rs extension.
+pub mod errcode {
+    /// Target family disabled by the server's IP policy, or `connect()` failed
+    /// with `EAFNOSUPPORT`.
+    pub const AF_DISABLED: u8 = 0x01;
+    /// `connect()` failed with `EADDRNOTAVAIL`.
+    pub const ADDR_NOT_AVAIL: u8 = 0x02;
+    /// `connect()` failed with `ENETUNREACH`.
+    pub const NET_UNREACH: u8 = 0x03;
+    /// `connect()` failed with `ECONNRESET`.
+    pub const CONN_RESET: u8 = 0x04;
+    /// `connect()` failed with `ETIMEDOUT`.
+    pub const TIMED_OUT: u8 = 0x05;
+    /// `connect()` failed with `ECONNREFUSED`.
+    pub const CONN_REFUSED: u8 = 0x06;
+    /// `connect()` failed with `EHOSTUNREACH`.
+    pub const HOST_UNREACH: u8 = 0x08;
+    /// DNS lookup failed, or its results didn't match an `ipv4-only` /
+    /// `ipv6-only` policy.
+    pub const DNS_FAILED: u8 = 0x64;
+    /// The target closed the connection before the tunnel was acknowledged.
+    pub const REMOTE_EOF: u8 = 0x65;
+    /// `connect()` failed with an errno outside the official table.
+    pub const UNKNOWN: u8 = 0xff;
+    /// snell-rs extension: target blocked by the `BLOCK_PRIVATE_TARGETS` SSRF
+    /// guard. Official snell-server has no such feature and never sends 0x00.
+    pub const FORBIDDEN: u8 = 0x00;
+}
+
+pub const MSG_IPV6_DISABLED: &str = "IPv6 target is disabled by server configuration";
+pub const MSG_IPV4_DISABLED: &str = "IPv4 target is disabled by server configuration";
+pub const MSG_DNS_FAILED: &str = "DNS Failed";
+pub const MSG_REMOTE_EOF: &str = "Remote EOF";
+pub const MSG_FORBIDDEN: &str = "forbidden";
+const MSG_CONNECT_FAILED: &str = "Connection failed";
+
+/// Build a `RESP_ERROR` frame: `[0x02][code][msg_len][msg]`. The length field is
+/// one byte, so `msg` is truncated at 255 bytes.
+pub fn error_frame(code: u8, msg: &str) -> Vec<u8> {
+    let msg = msg.as_bytes();
+    let msg = &msg[..msg.len().min(255)];
+    let mut out = Vec::with_capacity(3 + msg.len());
+    out.extend_from_slice(&[RESP_ERROR, code, msg.len() as u8]);
+    out.extend_from_slice(msg);
+    out
+}
+
+/// Map a failed outbound `connect()` to the official error code and message.
+pub fn connect_error(err: &std::io::Error) -> (u8, &'static str) {
+    #[cfg(unix)]
+    if let Some(errno) = err.raw_os_error() {
+        return match errno {
+            libc::EAFNOSUPPORT => (
+                errcode::AF_DISABLED,
+                "Address family not supported by protocol",
+            ),
+            libc::EADDRNOTAVAIL => (errcode::ADDR_NOT_AVAIL, "Cannot assign requested address"),
+            libc::ENETUNREACH => (errcode::NET_UNREACH, "Network is unreachable"),
+            libc::ECONNRESET => (errcode::CONN_RESET, "Connection reset by peer"),
+            libc::ETIMEDOUT => (errcode::TIMED_OUT, "Connection timed out"),
+            libc::ECONNREFUSED => (errcode::CONN_REFUSED, "Connection refused"),
+            libc::EHOSTUNREACH => (errcode::HOST_UNREACH, "No route to host"),
+            _ => (errcode::UNKNOWN, MSG_CONNECT_FAILED),
+        };
+    }
+    match err.kind() {
+        std::io::ErrorKind::AddrNotAvailable => {
+            (errcode::ADDR_NOT_AVAIL, "Cannot assign requested address")
+        }
+        std::io::ErrorKind::NetworkUnreachable => {
+            (errcode::NET_UNREACH, "Network is unreachable")
+        }
+        std::io::ErrorKind::ConnectionReset => (errcode::CONN_RESET, "Connection reset by peer"),
+        std::io::ErrorKind::TimedOut => (errcode::TIMED_OUT, "Connection timed out"),
+        std::io::ErrorKind::ConnectionRefused => (errcode::CONN_REFUSED, "Connection refused"),
+        std::io::ErrorKind::HostUnreachable => (errcode::HOST_UNREACH, "No route to host"),
+        _ => (errcode::UNKNOWN, MSG_CONNECT_FAILED),
+    }
+}
+
+/// Map a failure while pushing the handshake's bundled app data to a freshly
+/// connected target: a target that hangs up right away surfaces as
+/// [`errcode::REMOTE_EOF`], anything else reuses the `connect()` table.
+pub fn pre_tunnel_error(err: &std::io::Error) -> (u8, &'static str) {
+    use std::io::ErrorKind as K;
+    match err.kind() {
+        K::BrokenPipe | K::UnexpectedEof | K::WriteZero | K::ConnectionAborted => {
+            (errcode::REMOTE_EOF, MSG_REMOTE_EOF)
+        }
+        _ => connect_error(err),
+    }
+}
+
 pub struct SnellRequest {
     pub command: u8,
     pub host: String,
@@ -354,6 +449,98 @@ mod tests {
             0x50,
         ];
         assert!(parse_request(data).is_err());
+    }
+
+    // ---- error frames --------------------------------------------------------
+
+    #[test]
+    fn error_frame_layout_is_code_len_msg() {
+        let f = error_frame(errcode::DNS_FAILED, MSG_DNS_FAILED);
+        assert_eq!(f[0], RESP_ERROR);
+        assert_eq!(f[1], 0x64);
+        assert_eq!(f[2] as usize, MSG_DNS_FAILED.len());
+        assert_eq!(&f[3..], MSG_DNS_FAILED.as_bytes());
+        assert_eq!(f.len(), 3 + MSG_DNS_FAILED.len());
+    }
+
+    #[test]
+    fn error_frame_truncates_msg_to_length_byte() {
+        let long = "x".repeat(300);
+        let f = error_frame(errcode::UNKNOWN, &long);
+        assert_eq!(f[2], 255);
+        assert_eq!(f.len(), 3 + 255);
+    }
+
+    #[test]
+    fn official_error_codes_are_stable() {
+        assert_eq!(errcode::AF_DISABLED, 0x01);
+        assert_eq!(errcode::ADDR_NOT_AVAIL, 0x02);
+        assert_eq!(errcode::NET_UNREACH, 0x03);
+        assert_eq!(errcode::CONN_RESET, 0x04);
+        assert_eq!(errcode::TIMED_OUT, 0x05);
+        assert_eq!(errcode::CONN_REFUSED, 0x06);
+        assert_eq!(errcode::HOST_UNREACH, 0x08);
+        assert_eq!(errcode::DNS_FAILED, 0x64);
+        assert_eq!(errcode::REMOTE_EOF, 0x65);
+        assert_eq!(errcode::UNKNOWN, 0xff);
+    }
+
+    #[test]
+    fn official_messages_are_verbatim() {
+        assert_eq!(
+            MSG_IPV6_DISABLED,
+            "IPv6 target is disabled by server configuration"
+        );
+        assert_eq!(
+            MSG_IPV4_DISABLED,
+            "IPv4 target is disabled by server configuration"
+        );
+        assert_eq!(MSG_DNS_FAILED, "DNS Failed");
+        assert_eq!(MSG_REMOTE_EOF, "Remote EOF");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_error_maps_official_errno_table() {
+        let cases = [
+            (libc::EAFNOSUPPORT, errcode::AF_DISABLED),
+            (libc::EADDRNOTAVAIL, errcode::ADDR_NOT_AVAIL),
+            (libc::ENETUNREACH, errcode::NET_UNREACH),
+            (libc::ECONNRESET, errcode::CONN_RESET),
+            (libc::ETIMEDOUT, errcode::TIMED_OUT),
+            (libc::ECONNREFUSED, errcode::CONN_REFUSED),
+            (libc::EHOSTUNREACH, errcode::HOST_UNREACH),
+            (libc::EACCES, errcode::UNKNOWN),
+        ];
+        for (errno, want) in cases {
+            let e = std::io::Error::from_raw_os_error(errno);
+            let (code, msg) = connect_error(&e);
+            assert_eq!(code, want, "errno {errno}");
+            assert!(!msg.is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_tunnel_error_reports_remote_eof_for_early_close() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let e = std::io::Error::new(kind, "gone");
+            assert_eq!(
+                pre_tunnel_error(&e),
+                (errcode::REMOTE_EOF, MSG_REMOTE_EOF),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_tunnel_error_falls_back_to_connect_table() {
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(pre_tunnel_error(&e).0, errcode::CONN_REFUSED);
     }
 
     // ---- chunk round-trips ---------------------------------------------------
