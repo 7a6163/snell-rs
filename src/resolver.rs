@@ -407,7 +407,10 @@ mod tests {
 
     #[test]
     fn parse_ip_literal_accepts_bracketed_and_zoned_forms() {
-        assert_eq!(parse_ip_literal("1.2.3.4"), Some("1.2.3.4".parse().unwrap()));
+        assert_eq!(
+            parse_ip_literal("1.2.3.4"),
+            Some("1.2.3.4".parse().unwrap())
+        );
         assert_eq!(parse_ip_literal("::1"), Some("::1".parse().unwrap()));
         assert_eq!(parse_ip_literal("[::1]"), Some("::1".parse().unwrap()));
         assert_eq!(

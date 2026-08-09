@@ -84,9 +84,7 @@ pub fn connect_error(err: &std::io::Error) -> (u8, &'static str) {
         std::io::ErrorKind::AddrNotAvailable => {
             (errcode::ADDR_NOT_AVAIL, "Cannot assign requested address")
         }
-        std::io::ErrorKind::NetworkUnreachable => {
-            (errcode::NET_UNREACH, "Network is unreachable")
-        }
+        std::io::ErrorKind::NetworkUnreachable => (errcode::NET_UNREACH, "Network is unreachable"),
         std::io::ErrorKind::ConnectionReset => (errcode::CONN_RESET, "Connection reset by peer"),
         std::io::ErrorKind::TimedOut => (errcode::TIMED_OUT, "Connection timed out"),
         std::io::ErrorKind::ConnectionRefused => (errcode::CONN_REFUSED, "Connection refused"),

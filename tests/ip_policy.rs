@@ -105,8 +105,7 @@ async fn ipv4_only_rejects_ipv6_literal() {
 #[tokio::test]
 async fn ipv6_only_rejects_ipv4_literal() {
     let server_port = random_tcp_port();
-    let _server =
-        spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv6-only")]);
+    let _server = spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv6-only")]);
     wait_tcp(server_port).await;
 
     let frame = connect_reply(server_port, "1.1.1.1", 80).await;
@@ -143,8 +142,7 @@ async fn ipv6_only_allows_ipv6_literal() {
         return;
     };
     let server_port = random_tcp_port();
-    let _server =
-        spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv6-only")]);
+    let _server = spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv6-only")]);
     wait_tcp(server_port).await;
 
     assert_tunnel_echoes(server_port, "::1", echo_port).await;
@@ -171,8 +169,7 @@ async fn prefer_and_default_policies_allow_ipv6_literal() {
 async fn preference_overrides_unset_ipv6_flag() {
     // IPV6 unset (would be ipv4-only) + ipv6-only → the IPv4 literal is blocked.
     let server_port = random_tcp_port();
-    let _server =
-        spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "only-ipv6")]);
+    let _server = spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "only-ipv6")]);
     wait_tcp(server_port).await;
 
     let frame = connect_reply(server_port, "1.1.1.1", 80).await;

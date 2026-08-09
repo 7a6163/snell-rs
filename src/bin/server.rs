@@ -707,12 +707,7 @@ async fn handle_quic_init(
 /// decrypt it; a fresh salt is required because reusing the init salt would
 /// repeat that key's nonce counter. Init packets that fail to decrypt stay
 /// unanswered — replying to unauthenticated input would make the port probeable.
-async fn send_quic_error(
-    sock: &tokio::net::UdpSocket,
-    dst: SocketAddr,
-    psk: &[u8],
-    frame: &[u8],
-) {
+async fn send_quic_error(sock: &tokio::net::UdpSocket, dst: SocketAddr, psk: &[u8], frame: &[u8]) {
     let Ok((salt, mut cipher)) = SnellCipher::with_random_salt(psk) else {
         return;
     };
