@@ -8,3 +8,4 @@ pub mod resolver;
 pub mod salt_cache;
 pub mod snell;
 pub mod tfo;
+pub mod v6;

@@ -6,37 +6,13 @@
 mod common;
 use common::*;
 
-use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::snell::{
     CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL,
     encode_udp_request, parse_udp_response, read_chunk, write_chunk,
 };
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
-
-/// Perform a plain Snell v5 handshake against the server and return the
-/// connection plus the (client→server, server→client) ciphers.
-async fn handshake(server_port: u16) -> (TcpStream, SnellCipher, SnellCipher) {
-    let psk = PSK.as_bytes();
-    let mut conn = TcpStream::connect(("127.0.0.1", server_port))
-        .await
-        .unwrap();
-    // First byte must avoid the obfs auto-detect (0x16 = TLS, 'G' = HTTP).
-    let mut salt = [0u8; SALT_LEN];
-    salt[0] = 0x01;
-    for b in salt.iter_mut().skip(1) {
-        *b = rand::random();
-    }
-    let c2s = SnellCipher::new(psk, &salt).unwrap();
-    conn.write_all(&salt).await.unwrap();
-    // The server sends its salt up front, before reading the request.
-    let mut server_salt = [0u8; SALT_LEN];
-    conn.read_exact(&mut server_salt).await.unwrap();
-    let s2c = SnellCipher::new(psk, &server_salt).unwrap();
-    (conn, c2s, s2c)
-}
 
 async fn spawn_udp_echo() -> u16 {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -56,7 +32,7 @@ async fn server_replies_pong_to_ping() {
     let _server = spawn_server(server_port, false);
     wait_tcp(server_port).await;
 
-    let (mut conn, mut c2s, mut s2c) = handshake(server_port).await;
+    let (mut conn, mut c2s, mut s2c) = snell_handshake(server_port).await;
     write_chunk(&mut conn, &mut c2s, &[0x01, CMD_PING, 0x00])
         .await
         .unwrap();
@@ -71,7 +47,7 @@ async fn server_sends_error_when_target_refuses() {
     let _server = spawn_server(server_port, false);
     wait_tcp(server_port).await;
 
-    let (mut conn, mut c2s, mut s2c) = handshake(server_port).await;
+    let (mut conn, mut c2s, mut s2c) = snell_handshake(server_port).await;
     let mut req = vec![0x01, CMD_CONNECT_V2, 0x00, 9];
     req.extend_from_slice(b"127.0.0.1");
     req.extend_from_slice(&closed.to_be_bytes());
@@ -87,7 +63,7 @@ async fn server_rejects_unknown_command() {
     let _server = spawn_server(server_port, false);
     wait_tcp(server_port).await;
 
-    let (mut conn, mut c2s, mut s2c) = handshake(server_port).await;
+    let (mut conn, mut c2s, mut s2c) = snell_handshake(server_port).await;
     write_chunk(&mut conn, &mut c2s, &[0x01, 0x77, 0x00])
         .await
         .unwrap();
@@ -106,7 +82,7 @@ async fn server_udp_relays_datagram_to_echo() {
     let _server = spawn_server(server_port, false);
     wait_tcp(server_port).await;
 
-    let (mut conn, mut c2s, mut s2c) = handshake(server_port).await;
+    let (mut conn, mut c2s, mut s2c) = snell_handshake(server_port).await;
     // Open the UDP session: empty placeholder target.
     write_chunk(&mut conn, &mut c2s, &[0x01, CMD_CONNECT_UDP, 0, 0, 0, 0])
         .await

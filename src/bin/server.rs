@@ -5,9 +5,12 @@
 //! Environment variables:
 //!   PSK                   Pre-shared key (required, min 16 chars)
 //!   EGRESS_INTERFACE      Bind outgoing connections to this network interface
-//!   IPV6=1                Allow IPv6 outbound targets. Default off (IPv4-only
-//!                         egress), matching official snell-server `ipv6=false`:
-//!                         AAAA results are skipped unless this is set.
+//!   IPV6                  Official `ipv6=` flag: a leading t/T/y/Y/1 allows both
+//!                         families, anything else (and unset) is IPv4-only egress.
+//!   DNS_IP_PREFERENCE     Official `dns-ip-preference=`: default | first-result |
+//!                         prefer-ipv4 | ipv4-preferred | prefer-ipv6 |
+//!                         ipv6-preferred | ipv4-only | only-ipv4 | ipv6-only |
+//!                         only-ipv6. Overrides IPV6 whenever set.
 //!   DNS                   Comma-separated upstream DNS server IPs for resolving
 //!                         target hostnames (e.g. DNS=1.1.1.1,8.8.8.8). Queried
 //!                         over UDP+TCP port 53. Unset = system resolver.
@@ -34,14 +37,20 @@
 //!   obfs=tls  — 0x16 (TLS ClientHello)
 
 use anyhow::{Result, bail};
+use rand::RngCore;
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::quic::{SessionTable, UdpSession, gc_sessions, new_session_table};
 use snell::relay::copy_t2c_adaptive;
-use snell::resolver::Resolver;
+use snell::resolver::{IpPolicy, Resolver, parse_ip_literal};
 use snell::salt_cache::SaltCache;
 use snell::snell::{
-    CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, RESP_ERROR, RESP_PONG, RESP_TUNNEL,
-    parse_request, read_chunk, write_chunk,
+    CMD_CONNECT, CMD_CONNECT_UDP, CMD_CONNECT_V2, CMD_PING, MSG_DNS_FAILED, MSG_FORBIDDEN,
+    MSG_IPV4_DISABLED, MSG_IPV6_DISABLED, RESP_PONG, RESP_TUNNEL, connect_error, errcode,
+    error_frame, parse_request, pre_tunnel_error, read_chunk, write_chunk,
+};
+use snell::v6::{
+    Mode, Profile, read_record, read_unsafe_raw, write_records, write_unsafe_raw,
+    write_unsafe_raw_zero, write_zero_record,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -152,14 +161,13 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     let block_private = std::env::var("BLOCK_PRIVATE_TARGETS")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // IPv6 egress toggle. Default false (IPv4-only outbound) to match official
-    // snell-server's `ipv6=false`: AAAA results are skipped unless explicitly
-    // enabled. Set IPV6=1 to allow IPv6 targets.
-    let ipv6 = std::env::var("IPV6").map(|v| v == "1").unwrap_or(false);
+    // Address-family policy for outbound targets, from IPV6 / DNS_IP_PREFERENCE.
+    // Default (both unset) is ipv4-only, matching official `ipv6=false`.
+    let policy = IpPolicy::from_env()?;
     // Outbound DNS resolver. Defaults to the system resolver; when DNS lists
     // upstream IPs (e.g. DNS=1.1.1.1,8.8.8.8) a hickory resolver is built. The
-    // IPv6 toggle is folded in so all resolution honors it uniformly.
-    let resolver = Arc::new(Resolver::from_env(ipv6)?);
+    // policy is folded in so all resolution honors it uniformly.
+    let resolver = Arc::new(Resolver::from_env(policy)?);
     // TCP_FASTOPEN defaults to on (matches official snell-server).
     // Explicitly set TCP_FASTOPEN=0 to disable. Anything else (including unset
     // or "1") leaves it enabled. The effective state still requires the kernel
@@ -179,6 +187,17 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT);
+
+    // v6 encryption mode (out-of-band; client must match). Unset defaults to
+    // `unshaped`, which is byte-identical to the v5 wire this crate has always
+    // spoken — so existing v5 deployments are unaffected. `default` enables the
+    // v6 shaped handshake (scattered salt frame + per-chunk prefixed records);
+    // `unsafe-raw` is plaintext framing (no salt/KDF/cipher).
+    let mode = match std::env::var("MODE") {
+        Ok(s) => Mode::parse(&s)
+            .ok_or_else(|| anyhow::anyhow!("invalid MODE '{s}' (default|unshaped|unsafe-raw)"))?,
+        Err(_) => Mode::Unshaped,
+    };
 
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
     let session_table = new_session_table();
@@ -250,9 +269,13 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         false
     };
 
+    let mode_label = match mode {
+        Mode::Default => "v6/default (shaped)",
+        Mode::Unshaped => "v5 / v6-unshaped (plain / obfs=http / obfs=tls)",
+        Mode::UnsafeRaw => "v6/unsafe-raw (plaintext)",
+    };
     eprintln!(
-        "snell-server v5 listening on {listen}  \
-         (plain / obfs=http / obfs=tls{}{})",
+        "snell-server listening on {listen}  [{mode_label}]{}{}",
         if quic_enabled { " / QUIC" } else { "" },
         egress_iface
             .as_deref()
@@ -306,6 +329,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
                 conn,
                 &psk,
                 &tls_acceptor,
+                mode,
                 iface.as_deref().map(String::as_str),
                 block_private,
                 &resolver,
@@ -455,6 +479,51 @@ fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
     }
 }
 
+/// Resolve a CONNECT target to one outbound address.
+///
+/// rc2 checks IP literals against the address-family policy *before* DNS and
+/// never looks them up: only the `*-only` policies reject one, `prefer-*` never
+/// does. `Err` carries the ready-to-send `RESP_ERROR` frame; the caller is still
+/// responsible for the SSRF check (a snell-rs extension the official server
+/// doesn't have).
+async fn resolve_target(host: &str, port: u16, resolver: &Resolver) -> Result<SocketAddr, Vec<u8>> {
+    if let Some(ip) = parse_ip_literal(host) {
+        if !resolver.policy().allows(ip) {
+            let (family, msg) = if ip.is_ipv6() {
+                ("IPv6", MSG_IPV6_DISABLED)
+            } else {
+                ("IPv4", MSG_IPV4_DISABLED)
+            };
+            tracing::warn!(
+                "{family} target {host}:{port} rejected: {family} is disabled by server configuration"
+            );
+            return Err(error_frame(errcode::AF_DISABLED, msg));
+        }
+        tracing::debug!(%host, port, "Target is an IP literal; skip DNS lookup");
+        return Ok(SocketAddr::new(ip, port));
+    }
+    match resolver.resolve(host, port).await {
+        Ok(Some(addr)) => Ok(addr),
+        // A policy-filtered or empty result is a DNS failure to the client; the
+        // policy mismatch itself is logged by the resolver.
+        Ok(None) => Err(error_frame(errcode::DNS_FAILED, MSG_DNS_FAILED)),
+        Err(e) => {
+            tracing::warn!(%host, port, error = %e, "DNS resolution failed");
+            Err(error_frame(errcode::DNS_FAILED, MSG_DNS_FAILED))
+        }
+    }
+}
+
+/// Frame for an outbound `connect()` failure, mapped to the official error code.
+fn connect_error_frame(e: &anyhow::Error) -> Vec<u8> {
+    // egress::connect_tcp wraps the io::Error in context, so walk the chain.
+    let (code, msg) = match e.chain().find_map(|c| c.downcast_ref::<std::io::Error>()) {
+        Some(io) => connect_error(io),
+        None => (errcode::UNKNOWN, "Connection failed"),
+    };
+    error_frame(code, msg)
+}
+
 /// UDP relay loop: classify datagrams by byte[0] and route by source sockaddr.
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_relay(
@@ -562,13 +631,23 @@ async fn handle_quic_init(
     };
     tracing::debug!(%src, host = %req.host, port = req.port, "QUIC CONNECT_UDP");
 
-    // Resolve and SSRF-check
-    let target_addr: SocketAddr = match resolver.resolve(&req.host, req.port).await {
-        Ok(Some(a)) => a,
-        Ok(None) | Err(_) => return,
+    // Resolve (literal fast path + policy gate) and SSRF-check.
+    let target_addr: SocketAddr = match resolve_target(&req.host, req.port, resolver).await {
+        Ok(a) => a,
+        Err(frame) => {
+            send_quic_error(sock, src, psk, &frame).await;
+            return;
+        }
     };
     if !is_safe_target(&target_addr, block_private) {
         tracing::warn!(%target_addr, "QUIC SSRF blocked");
+        send_quic_error(
+            sock,
+            src,
+            psk,
+            &error_frame(errcode::FORBIDDEN, MSG_FORBIDDEN),
+        )
+        .await;
         return;
     }
 
@@ -577,11 +656,14 @@ async fn handle_quic_init(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "QUIC outbound bind failed");
+            send_quic_error(sock, src, psk, &connect_error_frame(&e)).await;
             return;
         }
     };
     if let Err(e) = target_sock.connect(target_addr).await {
         tracing::warn!(error = %e, "QUIC outbound connect failed");
+        let (code, msg) = connect_error(&e);
+        send_quic_error(sock, src, psk, &error_frame(code, msg)).await;
         return;
     }
     let target_sock = Arc::new(target_sock);
@@ -619,17 +701,58 @@ async fn handle_quic_init(
     });
 }
 
+/// Answer a rejected QUIC `CONNECT_UDP` with an error frame instead of dropping
+/// the datagram (rc2 behavior). The datagram carries a fresh 16-byte salt plus
+/// one sealed chunk, mirroring the TCP handshake layout, so a PSK holder can
+/// decrypt it; a fresh salt is required because reusing the init salt would
+/// repeat that key's nonce counter. Init packets that fail to decrypt stay
+/// unanswered — replying to unauthenticated input would make the port probeable.
+async fn send_quic_error(sock: &tokio::net::UdpSocket, dst: SocketAddr, psk: &[u8], frame: &[u8]) {
+    let Ok((salt, mut cipher)) = SnellCipher::with_random_salt(psk) else {
+        return;
+    };
+    let Ok(chunk) = cipher.seal(frame) else {
+        return;
+    };
+    let mut pkt = Vec::with_capacity(salt.len() + chunk.len());
+    pkt.extend_from_slice(&salt);
+    pkt.extend_from_slice(&chunk);
+    let _ = sock.send_to(&pkt, dst).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     mut conn: TcpStream,
     psk: &[u8],
     tls: &TlsAcceptor,
+    mode: Mode,
     iface: Option<&str>,
     block_private: bool,
     resolver: &Resolver,
     tfo_out: bool,
     salt_cache: &SaltCache,
 ) -> Result<()> {
+    // v6 modes bypass the v5 obfs auto-detect and go straight to their own
+    // handshake. `unshaped` is the v5 wire, so it keeps the obfs peek below.
+    match mode {
+        Mode::Default => {
+            return handle_v6_default(
+                conn,
+                psk,
+                iface,
+                block_private,
+                resolver,
+                tfo_out,
+                salt_cache,
+            )
+            .await;
+        }
+        Mode::UnsafeRaw => {
+            return handle_unsafe_raw(conn, iface, block_private, resolver, tfo_out).await;
+        }
+        Mode::Unshaped => {}
+    }
+
     // T2-F: each handshake phase has its own budget so a slow attacker can't
     // squat the full 30 s on a single phase. The relay loop inside handle()
     // is intentionally unbounded — only the handshake stages are timed.
@@ -780,10 +903,13 @@ where
 
         tracing::debug!(host = %req.host, port = req.port, "CONNECT");
 
-        let target_addr: SocketAddr = resolver
-            .resolve(&req.host, req.port)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("DNS: no address for {}", req.host))?;
+        let target_addr: SocketAddr = match resolve_target(&req.host, req.port, resolver).await {
+            Ok(a) => a,
+            Err(frame) => {
+                conn.write_all(&s2c.seal(&frame)?).await?;
+                continue;
+            }
+        };
 
         if !is_safe_target(&target_addr, block_private) {
             tracing::warn!(
@@ -792,9 +918,8 @@ where
                 resolved = %target_addr,
                 "SSRF blocked CONNECT"
             );
-            let mut r = vec![RESP_ERROR, 0u8, 9];
-            r.extend_from_slice(b"forbidden");
-            conn.write_all(&s2c.seal(&r)?).await?;
+            conn.write_all(&s2c.seal(&error_frame(errcode::FORBIDDEN, MSG_FORBIDDEN))?)
+                .await?;
             continue;
         }
 
@@ -802,20 +927,24 @@ where
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
-                // Generic public error — don't leak internal details
-                let msg = b"connection failed";
-                let mut r = vec![RESP_ERROR, 0u8, msg.len() as u8];
-                r.extend_from_slice(msg);
-                conn.write_all(&s2c.seal(&r)?).await?;
+                conn.write_all(&s2c.seal(&connect_error_frame(&e))?).await?;
                 continue;
             }
         };
 
-        conn.write_all(&s2c.seal(&[RESP_TUNNEL])?).await?;
-
-        if !req.trailing.is_empty() {
-            target.write_all(&req.trailing).await?;
+        // The bundled app data goes out before the tunnel is acknowledged, so a
+        // target that hangs up immediately is reported as an error frame rather
+        // than a tunnel that dies on first read.
+        if !req.trailing.is_empty()
+            && let Err(e) = target.write_all(&req.trailing).await
+        {
+            tracing::warn!(host = %req.host, port = req.port, error = %e, "target closed before tunnel");
+            let (code, msg) = pre_tunnel_error(&e);
+            conn.write_all(&s2c.seal(&error_frame(code, msg))?).await?;
+            continue;
         }
+
+        conn.write_all(&s2c.seal(&[RESP_TUNNEL])?).await?;
 
         let (cr, cw) = tokio::io::split(conn);
         let (tr, mut tw) = tokio::io::split(target);
@@ -844,6 +973,227 @@ where
         conn = cr.unsplit(cw);
     }
 
+    Ok(())
+}
+
+/// v6 `default` (shaped) TCP CONNECT handler. The client salt arrives scattered
+/// in a PSK-sized first frame; every subsequent chunk is a prefixed record whose
+/// prefix doubles as the header AEAD AAD. Single request per connection.
+async fn handle_v6_default(
+    mut conn: TcpStream,
+    psk: &[u8],
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+    tfo_out: bool,
+    salt_cache: &SaltCache,
+) -> Result<()> {
+    let profile = Profile::derive(psk);
+
+    // Handshake: recover the client salt from the scattered first frame.
+    let mut frame = vec![0u8; profile.frame_len()];
+    tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        conn.read_exact(&mut frame),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("v6 first-frame timeout"))??;
+    let client_salt = profile.decode_first_frame(&frame)?;
+
+    // CVE-3: reject replayed salts before the costly argon2id KDF runs.
+    if !salt_cache.check_and_insert(&client_salt) {
+        bail!("salt replay detected");
+    }
+    let mut c2s = SnellCipher::new(psk, &client_salt)?;
+    let mut c2s_k = 0u64;
+
+    // Reply with our own salt scattered into a symmetric first frame.
+    let (server_salt, mut s2c) = SnellCipher::with_random_salt(psk)?;
+    let mut filler = vec![0u8; profile.frame_len()];
+    rand::thread_rng().fill_bytes(&mut filler);
+    conn.write_all(&profile.encode_first_frame(&server_salt, Some(&filler))?)
+        .await?;
+    let mut s2c_k = 0u64;
+
+    // First record is the CONNECT request.
+    let Some(payload) = tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        read_record(&mut conn, &mut c2s, &profile, &mut c2s_k),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("v6 request timeout"))??
+    else {
+        return Ok(());
+    };
+    let req = parse_request(&payload)?;
+
+    if req.command == CMD_PING {
+        write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &[RESP_PONG]).await?;
+        return Ok(());
+    }
+    if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
+        bail!(
+            "command {:#04x} unsupported in v6/default (TCP CONNECT only)",
+            req.command
+        );
+    }
+    tracing::debug!(host = %req.host, port = req.port, "v6/default CONNECT");
+
+    let target_addr: SocketAddr = match resolve_target(&req.host, req.port, resolver).await {
+        Ok(a) => a,
+        Err(frame) => {
+            write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &frame).await?;
+            return Ok(());
+        }
+    };
+    if !is_safe_target(&target_addr, block_private) {
+        tracing::warn!(resolved = %target_addr, "SSRF blocked CONNECT");
+        let frame = error_frame(errcode::FORBIDDEN, MSG_FORBIDDEN);
+        write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &frame).await?;
+        return Ok(());
+    }
+
+    let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
+            let frame = connect_error_frame(&e);
+            write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &frame).await?;
+            return Ok(());
+        }
+    };
+
+    // See the v5 path: bundled app data precedes the tunnel acknowledgement so a
+    // target that hangs up immediately surfaces as an error frame.
+    if !req.trailing.is_empty()
+        && let Err(e) = target.write_all(&req.trailing).await
+    {
+        tracing::warn!(host = %req.host, port = req.port, error = %e, "target closed before tunnel");
+        let (code, msg) = pre_tunnel_error(&e);
+        let frame = error_frame(code, msg);
+        write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &frame).await?;
+        return Ok(());
+    }
+
+    write_records(&mut conn, &mut s2c, &profile, &mut s2c_k, &[RESP_TUNNEL]).await?;
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let (mut tr, mut tw) = tokio::io::split(target);
+    let profile_up = profile.clone();
+
+    let c2t = async move {
+        while let Some(d) = read_record(&mut cr, &mut c2s, &profile_up, &mut c2s_k).await? {
+            tw.write_all(&d).await?;
+        }
+        tw.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let t2c = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_records(&mut cw, &mut s2c, &profile, &mut s2c_k, &buf[..n]).await?;
+        }
+        write_zero_record(&mut cw, &mut s2c, &profile, &mut s2c_k).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(c2t, t2c)?;
+    Ok(())
+}
+
+/// v6 `unsafe-raw` (plaintext) TCP CONNECT handler: no salt, KDF, or cipher.
+/// Single request per connection.
+async fn handle_unsafe_raw(
+    mut conn: TcpStream,
+    iface: Option<&str>,
+    block_private: bool,
+    resolver: &Resolver,
+    tfo_out: bool,
+) -> Result<()> {
+    let Some(payload) = tokio::time::timeout(
+        Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+        read_unsafe_raw(&mut conn),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("unsafe-raw request timeout"))??
+    else {
+        return Ok(());
+    };
+    let req = parse_request(&payload)?;
+
+    if req.command == CMD_PING {
+        write_unsafe_raw(&mut conn, &[RESP_PONG]).await?;
+        return Ok(());
+    }
+    if req.command != CMD_CONNECT && req.command != CMD_CONNECT_V2 {
+        bail!(
+            "command {:#04x} unsupported in v6/unsafe-raw (TCP CONNECT only)",
+            req.command
+        );
+    }
+    tracing::debug!(host = %req.host, port = req.port, "v6/unsafe-raw CONNECT");
+
+    let target_addr: SocketAddr = match resolve_target(&req.host, req.port, resolver).await {
+        Ok(a) => a,
+        Err(frame) => {
+            write_unsafe_raw(&mut conn, &frame).await?;
+            return Ok(());
+        }
+    };
+    if !is_safe_target(&target_addr, block_private) {
+        tracing::warn!(resolved = %target_addr, "SSRF blocked CONNECT");
+        write_unsafe_raw(&mut conn, &error_frame(errcode::FORBIDDEN, MSG_FORBIDDEN)).await?;
+        return Ok(());
+    }
+
+    let mut target = match snell::egress::connect_tcp(target_addr, iface, tfo_out).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(host = %req.host, port = req.port, error = %e, "outbound connect failed");
+            write_unsafe_raw(&mut conn, &connect_error_frame(&e)).await?;
+            return Ok(());
+        }
+    };
+
+    // See the v5 path: bundled app data precedes the tunnel acknowledgement so a
+    // target that hangs up immediately surfaces as an error frame.
+    if !req.trailing.is_empty()
+        && let Err(e) = target.write_all(&req.trailing).await
+    {
+        tracing::warn!(host = %req.host, port = req.port, error = %e, "target closed before tunnel");
+        let (code, msg) = pre_tunnel_error(&e);
+        write_unsafe_raw(&mut conn, &error_frame(code, msg)).await?;
+        return Ok(());
+    }
+
+    write_unsafe_raw(&mut conn, &[RESP_TUNNEL]).await?;
+
+    let (mut cr, mut cw) = tokio::io::split(conn);
+    let (mut tr, mut tw) = tokio::io::split(target);
+
+    let c2t = async move {
+        while let Some(d) = read_unsafe_raw(&mut cr).await? {
+            tw.write_all(&d).await?;
+        }
+        tw.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let t2c = async move {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_unsafe_raw(&mut cw, &buf[..n]).await?;
+        }
+        write_unsafe_raw_zero(&mut cw).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(c2t, t2c)?;
     Ok(())
 }
 
@@ -1176,7 +1526,7 @@ mod tests {
     #[tokio::test]
     async fn forward_udp_frame_drops_malformed_frame() {
         let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
-        let resolver = Resolver::from_env(false).unwrap();
+        let resolver = Resolver::from_env(IpPolicy::Ipv4Only).unwrap();
         // Bad opcode → parse error → dropped without panic or send.
         forward_udp_frame(&[0xff, 0x00], &sock, false, &resolver).await;
     }
@@ -1184,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn forward_udp_frame_blocks_ssrf_target() {
         let sock = snell::egress::bind_udp("127.0.0.1:0".parse().unwrap(), None).unwrap();
-        let resolver = Resolver::from_env(false).unwrap();
+        let resolver = Resolver::from_env(IpPolicy::Ipv4Only).unwrap();
         // Private target + block_private=true → SSRF block branch. The IP literal
         // resolves without DNS, so the backend choice is irrelevant here.
         let frame = snell::snell::encode_udp_request("10.0.0.1", 53, b"x");
