@@ -14,14 +14,20 @@ pub const RESP_PONG: u8 = 0x01;
 pub const RESP_ERROR: u8 = 0x02;
 
 /// Error codes carried in the second byte of a `RESP_ERROR` frame. Values match
-/// official snell-server v6.0.0rc2, whose `connect()` failure table is indexed
-/// by `-errno`. [`errcode::FORBIDDEN`] is a snell-rs extension.
+/// official snell-server v6.0.0rc2, which maps a failed `connect()` through a
+/// 17-byte lookup table indexed by `-errno + 113` (valid for Linux errno
+/// 97..=113, anything else yields [`errcode::UNKNOWN`]). The table is byte
+/// identical in the rc2 amd64, i386 and aarch64 builds:
+/// `08 ff 06 05 ff ff ff ff ff 04 ff ff 03 02 ff ff 01`.
+/// Note the `ff` entries: `EADDRINUSE`, `EADDRNOTAVAIL`, `ENETRESET`,
+/// `ECONNABORTED` and `EHOSTDOWN` deliberately have no dedicated code.
+/// [`errcode::FORBIDDEN`] is a snell-rs extension.
 pub mod errcode {
     /// Target family disabled by the server's IP policy, or `connect()` failed
     /// with `EAFNOSUPPORT`.
     pub const AF_DISABLED: u8 = 0x01;
-    /// `connect()` failed with `EADDRNOTAVAIL`.
-    pub const ADDR_NOT_AVAIL: u8 = 0x02;
+    /// `connect()` failed with `ENETDOWN`.
+    pub const NET_DOWN: u8 = 0x02;
     /// `connect()` failed with `ENETUNREACH`.
     pub const NET_UNREACH: u8 = 0x03;
     /// `connect()` failed with `ECONNRESET`.
@@ -37,7 +43,7 @@ pub mod errcode {
     pub const DNS_FAILED: u8 = 0x64;
     /// The target closed the connection before the tunnel was acknowledged.
     pub const REMOTE_EOF: u8 = 0x65;
-    /// `connect()` failed with an errno outside the official table.
+    /// `connect()` failed with an errno the official table maps to no code.
     pub const UNKNOWN: u8 = 0xff;
     /// snell-rs extension: target blocked by the `BLOCK_PRIVATE_TARGETS` SSRF
     /// guard. Official snell-server has no such feature and never sends 0x00.
@@ -71,7 +77,7 @@ pub fn connect_error(err: &std::io::Error) -> (u8, &'static str) {
                 errcode::AF_DISABLED,
                 "Address family not supported by protocol",
             ),
-            libc::EADDRNOTAVAIL => (errcode::ADDR_NOT_AVAIL, "Cannot assign requested address"),
+            libc::ENETDOWN => (errcode::NET_DOWN, "Network is down"),
             libc::ENETUNREACH => (errcode::NET_UNREACH, "Network is unreachable"),
             libc::ECONNRESET => (errcode::CONN_RESET, "Connection reset by peer"),
             libc::ETIMEDOUT => (errcode::TIMED_OUT, "Connection timed out"),
@@ -81,9 +87,7 @@ pub fn connect_error(err: &std::io::Error) -> (u8, &'static str) {
         };
     }
     match err.kind() {
-        std::io::ErrorKind::AddrNotAvailable => {
-            (errcode::ADDR_NOT_AVAIL, "Cannot assign requested address")
-        }
+        std::io::ErrorKind::NetworkDown => (errcode::NET_DOWN, "Network is down"),
         std::io::ErrorKind::NetworkUnreachable => (errcode::NET_UNREACH, "Network is unreachable"),
         std::io::ErrorKind::ConnectionReset => (errcode::CONN_RESET, "Connection reset by peer"),
         std::io::ErrorKind::TimedOut => (errcode::TIMED_OUT, "Connection timed out"),
@@ -472,7 +476,7 @@ mod tests {
     #[test]
     fn official_error_codes_are_stable() {
         assert_eq!(errcode::AF_DISABLED, 0x01);
-        assert_eq!(errcode::ADDR_NOT_AVAIL, 0x02);
+        assert_eq!(errcode::NET_DOWN, 0x02);
         assert_eq!(errcode::NET_UNREACH, 0x03);
         assert_eq!(errcode::CONN_RESET, 0x04);
         assert_eq!(errcode::TIMED_OUT, 0x05);
@@ -500,13 +504,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn connect_error_maps_official_errno_table() {
+        // Every errno the official table covers, including the ones it maps to
+        // 0xff — those entries are load-bearing, not gaps waiting to be filled.
         let cases = [
             (libc::EAFNOSUPPORT, errcode::AF_DISABLED),
-            (libc::EADDRNOTAVAIL, errcode::ADDR_NOT_AVAIL),
+            (libc::EADDRINUSE, errcode::UNKNOWN),
+            (libc::EADDRNOTAVAIL, errcode::UNKNOWN),
+            (libc::ENETDOWN, errcode::NET_DOWN),
             (libc::ENETUNREACH, errcode::NET_UNREACH),
+            (libc::ENETRESET, errcode::UNKNOWN),
+            (libc::ECONNABORTED, errcode::UNKNOWN),
             (libc::ECONNRESET, errcode::CONN_RESET),
             (libc::ETIMEDOUT, errcode::TIMED_OUT),
             (libc::ECONNREFUSED, errcode::CONN_REFUSED),
+            (libc::EHOSTDOWN, errcode::UNKNOWN),
             (libc::EHOSTUNREACH, errcode::HOST_UNREACH),
             (libc::EACCES, errcode::UNKNOWN),
         ];
