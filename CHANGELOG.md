@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Align server with official v6.0.0rc2: clear error for literal targets blocked
   by IP policy; official error codes; five-state dns-ip-preference model.
 
+### Security
+
+- Bumped `lru` to 0.18.2 for RUSTSEC-2026-0253 (`LruCache::pop()` was not
+  panic-safe). The salt cache was never exposed to it — its key is `[u8; 16]`,
+  which has no `Drop`, and the advisory needs a panicking key `Drop` caught by
+  `catch_unwind` — but the audit gate has to stay clean.
+
 ## [6.0.0-rc.1] - 2026-07-21
 
 ### Added
