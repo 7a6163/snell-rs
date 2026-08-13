@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.0] - 2026-08-13
+
+### Fixed
+
+- **v6 `default` (shaped) mode could not talk to a real client at all.** Any
+  record carrying a junk region failed with `payload authentication failed`,
+  which is every record a Surge client sends. Two things were wrong, both
+  recovered by reverse-engineering the official binaries against captured
+  traffic:
+  - The payload AEAD authenticates over the record's junk region. We passed an
+    empty AAD.
+  - After sealing, the sender applies a PSK-derived self-inverse permutation
+    (official fn `0x41200`) that swaps bytes between the junk region and the
+    payload ciphertext; the receiver must undo it before opening. We instead had
+    an invented even-byte swap that matched nothing.
+
+  The header layer was always correct, which is why the failure surfaced as a
+  payload error and looked like a key problem.
+- A `default`-mode zero record carries its own junk region. The reader returned
+  end-of-session without draining those bytes, desynchronising the stream
+  against a peer that padded its terminator.
+- `unsafe-raw` carried the same invented even-byte swap, which would have
+  silently corrupted any frame a peer sent with a non-empty interleave. The junk
+  region is inert in that mode: the official binary reaches both the junk
+  generator and the mix only from the AEAD record writer and reader. Its
+  round-trip test was tautological — it built the wire with the same swap it was
+  meant to verify — and has been replaced.
+- `prefix_lo` was not clamped against `prefix_hi`. The official profile-init
+  epilogue (`0x42520`) clamps each lower bound against its upper bound; our port
+  missed it. No test PSK was affected (the clamp is a no-op when `lo ≤ 80 < 128
+  ≤ hi`), but the missing clamp would bite a PSK whose `prefix_hi` is clamped
+  down to 128 while `prefix_lo` exceeds it.
+
+### Added
+
+- **Wire-filler generator** (official fn `0x417c8`): all v6 padding — the
+  per-record prefix, the junk region, and the first-frame filler — is now
+  produced by the official PRF plus a popcount-table byte shaper. Every filler
+  byte has a PSK-derived popcount (4 for both test PSKs), making our traffic
+  byte-indistinguishable from the official server's at the byte-distribution
+  level. Previously the writer used `rand::thread_rng().fill_bytes()`, producing
+  uniformly random bytes that are trivially distinguishable from official
+  traffic by DPI.
+- **Interleave sizing pipeline** (fns `0x41630`/`0x41680`/`0x41b08`/`0x41cd0`):
+  the writer now computes the same junk-region sizes the official server
+  produces, including the target-size padding toward plausible packet sizes and
+  the first-record floor. Verified against both captured PSKs: PSK A produces
+  `interleave=879` (saturating the +730 pad cap), PSK B produces
+  `interleave=1022` (non-saturating, discriminating on `target_size`).
+- The writer now emits shaped records with junk and applies the mix, matching
+  the official wire format. Previously the writer always sent `interleave=0`,
+  which is conforming but defeats the DPI-resistance purpose of shaped mode.
+- `tests/surge_interop.rs` plus three fixtures of real captured Surge
+  `default`-mode traffic. The two PSKs land on different mix variants
+  (`mode 1, rounds 1` block swap and `mode 2, rounds 2` strided swap), so a
+  regression in either arm fails the suite. These are the first tests in the
+  repo that pin the v6 record layer against a real peer rather than against
+  ourselves.
+- `seal_record_shaped` and `SnellCipher::seal_with_junk` for emitting records
+  that carry a junk region, with round-trip coverage across junk sizes.
+
 ## [6.1.0] - 2026-08-13
 
 ### Changed

@@ -65,19 +65,48 @@ impl SnellCipher {
 
     /// Like [`seal`](Self::seal) but uses `header_aad` as the header chunk's AEAD
     /// AAD. v5 calls this with an empty `header_aad`; v6 passes the per-chunk
-    /// prefix bytes so they authenticate the header. The payload AAD stays empty
-    /// in both versions.
+    /// prefix bytes so they authenticate the header.
     pub fn seal_with_aad(&mut self, plaintext: &[u8], header_aad: &[u8]) -> Result<Vec<u8>> {
+        self.seal_with_junk(plaintext, header_aad, &[])
+    }
+
+    /// Seal a chunk that carries a junk region: `hdr_CT || junk || payload_CT`.
+    ///
+    /// The header advertises `junk.len()` as its interleave field and the payload
+    /// is authenticated over `junk`, so the junk bytes are covered by the payload
+    /// tag and cannot be rewritten in flight. v5 and junkless v6 records pass an
+    /// empty `junk`, which reproduces the plain `[hdr_CT | payload_CT]` layout.
+    ///
+    /// Callers doing v6 `default` mode must still apply the profile mix to the
+    /// junk and payload regions afterwards; see `v6::seal_record_shaped`.
+    pub fn seal_with_junk(
+        &mut self,
+        plaintext: &[u8],
+        header_aad: &[u8],
+        junk: &[u8],
+    ) -> Result<Vec<u8>> {
         if plaintext.len() > 0xffff {
             bail!("plaintext too large: {} bytes (max 65535)", plaintext.len());
         }
+        if junk.len() > 0xffff {
+            bail!("junk too large: {} bytes (max 65535)", junk.len());
+        }
         let n = plaintext.len();
+        let il = junk.len();
 
-        // Layout: [hdr_pt(7) | hdr_tag(16) | payload_pt(n) | payload_tag(16)]
-        let mut out = Vec::with_capacity(HDR_CT_LEN + n + 16);
+        // Layout: [hdr_pt(7) | hdr_tag(16) | junk(il) | payload_pt(n) | payload_tag(16)]
+        let mut out = Vec::with_capacity(HDR_CT_LEN + il + n + 16);
 
         // Header plaintext → encrypt in place (AAD = header_aad) → append tag.
-        out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, (n >> 8) as u8, (n & 0xff) as u8]);
+        out.extend_from_slice(&[
+            0x04u8,
+            0,
+            0,
+            (il >> 8) as u8,
+            (il & 0xff) as u8,
+            (n >> 8) as u8,
+            (n & 0xff) as u8,
+        ]);
         let hdr_tag = self
             .aead
             .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), header_aad, &mut out[..7])
@@ -85,14 +114,15 @@ impl SnellCipher {
         out.extend_from_slice(&hdr_tag);
         self.inc();
 
-        // Payload plaintext → encrypt in place → append 16-byte tag.
-        let pl_start = HDR_CT_LEN;
+        // Payload plaintext → encrypt in place (AAD = junk) → append 16-byte tag.
+        out.extend_from_slice(junk);
+        let pl_start = HDR_CT_LEN + il;
         out.extend_from_slice(plaintext);
         let pl_tag = self
             .aead
             .encrypt_in_place_detached(
                 Nonce::from_slice(&self.nonce),
-                &[],
+                junk,
                 &mut out[pl_start..pl_start + n],
             )
             .map_err(|_| anyhow::anyhow!("payload AEAD encrypt"))?;
@@ -111,8 +141,16 @@ impl SnellCipher {
     /// `header_aad`. v6 `default` mode passes the per-chunk prefix so the
     /// session-terminating zero record matches the prefixed-record layout.
     pub fn seal_zero_with_aad(&mut self, header_aad: &[u8]) -> Result<Vec<u8>> {
+        self.seal_zero_with_junk(header_aad, 0)
+    }
+
+    /// Like [`seal_zero_with_aad`](Self::seal_zero_with_aad) but advertises
+    /// `interleave` junk bytes after the header. A v6 zero record carries its
+    /// own junk region; the reader drains it to stay in sync.
+    pub fn seal_zero_with_junk(&mut self, header_aad: &[u8], interleave: usize) -> Result<Vec<u8>> {
+        let il = interleave;
         let mut out = Vec::with_capacity(HDR_CT_LEN);
-        out.extend_from_slice(&[0x04u8, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0x04u8, 0, 0, (il >> 8) as u8, (il & 0xff) as u8, 0, 0]);
         let tag = self
             .aead
             .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), header_aad, &mut out[..7])
@@ -136,6 +174,19 @@ impl SnellCipher {
         ct: &[u8; HDR_CT_LEN],
         aad: &[u8],
     ) -> Result<Option<(usize, usize)>> {
+        let (interleave, payload_len) = self.open_header_raw_with_aad(ct, aad)?;
+        Ok((payload_len != 0).then_some((interleave, payload_len)))
+    }
+
+    /// Like [`open_header_with_aad`](Self::open_header_with_aad) but reports the
+    /// zero chunk as `(interleave, 0)` instead of collapsing it to `None`. A v6
+    /// zero record still carries its `interleave` junk bytes, and the reader has
+    /// to drain them to stay in sync.
+    pub fn open_header_raw_with_aad(
+        &mut self,
+        ct: &[u8; HDR_CT_LEN],
+        aad: &[u8],
+    ) -> Result<(usize, usize)> {
         let pt = self
             .aead
             .decrypt(
@@ -153,19 +204,24 @@ impl SnellCipher {
                 pt.first().copied().unwrap_or(0)
             );
         }
-        let interleave = u16::from_be_bytes([pt[3], pt[4]]) as usize;
-        let payload_len = u16::from_be_bytes([pt[5], pt[6]]) as usize;
-        if payload_len == 0 {
-            return Ok(None);
-        }
-        Ok(Some((interleave, payload_len)))
+        Ok((
+            u16::from_be_bytes([pt[3], pt[4]]) as usize,
+            u16::from_be_bytes([pt[5], pt[6]]) as usize,
+        ))
     }
 
     /// Decrypt payload ciphertext (payload_len + 16 tag bytes).
     /// Nonce is incremented only on successful decryption.
     pub fn open_payload(&mut self, ct: &[u8]) -> Result<Vec<u8>> {
+        self.open_payload_with_aad(ct, &[])
+    }
+
+    /// Like [`open_payload`](Self::open_payload) but verifies against `aad`. A v6
+    /// record's payload is authenticated over its junk region; v5 and junkless v6
+    /// records pass empty.
+    pub fn open_payload_with_aad(&mut self, ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         self.aead
-            .decrypt(Nonce::from_slice(&self.nonce), ct)
+            .decrypt(Nonce::from_slice(&self.nonce), Payload { msg: ct, aad })
             .map_err(|_| anyhow::anyhow!("payload authentication failed"))
             .inspect(|_| self.inc())
     }

@@ -8,9 +8,14 @@
 //! ```
 //!
 //! There is no 16-byte AEAD tag and the header is 5 bytes (not the 7-byte
-//! AEAD-plaintext layout of the encrypted modes). The interleave scratch is the
-//! same even-byte-swap scheme the AEAD modes use; `encode` emits zero interleave
-//! and `decode` undoes any interleave it is given.
+//! AEAD-plaintext layout of the encrypted modes).
+//!
+//! The interleave scratch is inert here. In `default` mode the junk region is
+//! the payload's AEAD AAD and the two regions are permuted by a PSK-derived mix,
+//! but the official binary reaches both the junk generator (fn `0x417c8`) and
+//! the mix (fn `0x41200`) only from the AEAD record writer/reader — this mode
+//! has no such path. `encode` emits zero interleave and `decode` skips whatever
+//! it is given.
 
 /// Encode one plaintext chunk with zero interleave.
 pub fn encode_unsafe_raw(payload: &[u8]) -> Vec<u8> {
@@ -35,15 +40,7 @@ pub fn decode_unsafe_raw(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     if buf.len() < total {
         return None;
     }
-    let mut body = buf[5..total].to_vec();
-    // Undo the even-byte swap the sender applied across the interleave prefix.
-    if interleave > 0 {
-        let n = interleave.min(payload_len);
-        for i in (0..n).step_by(2) {
-            body.swap(i, interleave + i);
-        }
-    }
-    Some((body[interleave..].to_vec(), total))
+    Some((buf[5 + interleave..total].to_vec(), total))
 }
 
 #[cfg(test)]
@@ -86,22 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_undoes_interleave() {
-        // Hand-craft a chunk with interleave=2: body = [scratch:2][payload].
-        // The sender swap (even indices) is its own inverse, so building the wire
-        // by applying that swap lets decode recover the original payload.
+    fn decode_skips_interleave_without_transforming_the_payload() {
         let payload = b"abcd";
-        let interleave = 2usize;
-        let mut body = vec![0u8; interleave];
-        body.extend_from_slice(payload);
-        let n = interleave.min(payload.len());
-        for i in (0..n).step_by(2) {
-            body.swap(i, interleave + i);
-        }
         let mut wire = vec![0x04];
-        wire.extend_from_slice(&(interleave as u16).to_be_bytes());
+        wire.extend_from_slice(&3u16.to_be_bytes());
         wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        wire.extend_from_slice(&body);
+        wire.extend_from_slice(b"\xde\xad\xbe"); // junk
+        wire.extend_from_slice(payload);
 
         let (got, consumed) = decode_unsafe_raw(&wire).unwrap();
         assert_eq!(got, payload);

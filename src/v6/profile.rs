@@ -22,7 +22,7 @@ type Blake2b256 = Blake2b<U32>;
 pub(crate) const C1: u64 = 0xBF58476D1CE4E5B9;
 pub(crate) const C2: u64 = 0x94D049BB133111EB;
 pub(crate) const GOLDEN: u64 = 0x9E3779B97F4A7C15;
-const MUL: u64 = 0xD6E8FEB86659FD93;
+pub(crate) const MUL: u64 = 0xD6E8FEB86659FD93;
 const ADD: u64 = 0xA0761D6478BD642F;
 pub(crate) const K7: u64 = 0x8F3907F7B2B80C35;
 pub(crate) const K8: u64 = 0xE7037ED1A0B428DB;
@@ -134,7 +134,7 @@ impl Profile {
             .expect("seed offset present by construction")
     }
 
-    fn state_loader(&self, cat: u64) -> u64 {
+    pub(crate) fn state_loader(&self, cat: u64) -> u64 {
         if cat > 39 {
             self.seed_at(96)
         } else {
@@ -161,8 +161,13 @@ impl Profile {
 
     /// Bounded parameter: `lo + draw(cat,c) % (hi-lo+1)` (or `lo` if `hi <= lo`).
     pub(crate) fn param(&self, cat: u64, c: u64, lo: u32, hi: u32) -> u32 {
+        self.bound(self.draw(cat, c), lo, hi)
+    }
+
+    /// fn `0x40e68`: `lo + v % (hi-lo+1)`, masked to 16 bits (or `lo` if `hi <= lo`).
+    pub(crate) fn bound(&self, v: u32, lo: u32, hi: u32) -> u32 {
         if hi > lo {
-            lo + self.draw(cat, c) % (hi - lo + 1)
+            (lo + v % (hi - lo + 1)) & 0xffff
         } else {
             lo
         }

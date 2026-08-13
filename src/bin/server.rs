@@ -37,7 +37,6 @@
 //!   obfs=tls  — 0x16 (TLS ClientHello)
 
 use anyhow::{Result, bail};
-use rand::RngCore;
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::quic::{SessionTable, UdpSession, gc_sessions, new_session_table};
 use snell::relay::copy_t2c_adaptive;
@@ -1046,7 +1045,7 @@ async fn handle_v6_default(
     // Reply with our own salt scattered into a symmetric first frame.
     let (server_salt, mut s2c) = SnellCipher::with_random_salt(psk)?;
     let mut filler = vec![0u8; profile.frame_len()];
-    rand::thread_rng().fill_bytes(&mut filler);
+    profile.fill_filler(u64::from(u32::MAX), &mut filler);
     conn.write_all(&profile.encode_first_frame(&server_salt, Some(&filler))?)
         .await?;
     let mut s2c_k = 0u64;

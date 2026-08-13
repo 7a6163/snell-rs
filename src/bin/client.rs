@@ -10,7 +10,6 @@
 
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
-use rand::RngCore;
 use snell::cipher::{SALT_LEN, SnellCipher};
 use snell::snell::{CMD_CONNECT_UDP, RESP_TUNNEL, read_chunk, write_chunk};
 use snell::v6::{
@@ -297,7 +296,7 @@ async fn v6_default_tunnel(
     // Scatter our salt into the first frame, then send the request record.
     let (salt, mut c2s) = SnellCipher::with_random_salt(psk)?;
     let mut filler = vec![0u8; profile.frame_len()];
-    rand::thread_rng().fill_bytes(&mut filler);
+    profile.fill_filler(u64::from(u32::MAX), &mut filler);
     remote
         .write_all(&profile.encode_first_frame(&salt, Some(&filler))?)
         .await?;
