@@ -188,15 +188,15 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         .and_then(|v| v.parse().ok())
         .unwrap_or(TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT);
 
-    // v6 encryption mode (out-of-band; client must match). Unset defaults to
-    // `unshaped`, which is byte-identical to the v5 wire this crate has always
-    // spoken — so existing v5 deployments are unaffected. `default` enables the
-    // v6 shaped handshake (scattered salt frame + per-chunk prefixed records);
-    // `unsafe-raw` is plaintext framing (no salt/KDF/cipher).
+    // v6 encryption mode (out-of-band; client must match). Unset follows the
+    // official server, whose help text reads "Default: default." — the v6 shaped
+    // handshake (scattered salt frame + per-chunk prefixed records). Serving a v5
+    // client therefore needs an explicit `MODE=unshaped`, which is the
+    // byte-identical v5 wire; `unsafe-raw` is plaintext framing.
     let mode = match std::env::var("MODE") {
         Ok(s) => Mode::parse(&s)
             .ok_or_else(|| anyhow::anyhow!("invalid MODE '{s}' (default|unshaped|unsafe-raw)"))?,
-        Err(_) => Mode::Unshaped,
+        Err(_) => Mode::default(),
     };
 
     let tls_acceptor = Arc::new(make_tls_acceptor()?);
@@ -275,7 +275,8 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
         Mode::UnsafeRaw => "v6/unsafe-raw (plaintext)",
     };
     eprintln!(
-        "snell-server listening on {listen}  [{mode_label}]{}{}",
+        "snell-server {} listening on {listen}  [{mode_label}]{}{}",
+        env!("CARGO_PKG_VERSION"),
         if quic_enabled { " / QUIC" } else { "" },
         egress_iface
             .as_deref()
@@ -338,7 +339,11 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
             )
             .await
             {
-                tracing::error!(%peer, error = %e, "connection failed");
+                tracing::error!(
+                    %peer,
+                    error = %handshake_error_message(&e, mode),
+                    "connection failed"
+                );
             }
         });
     }
@@ -718,6 +723,37 @@ async fn send_quic_error(sock: &tokio::net::UdpSocket, dst: SocketAddr, psk: &[u
     pkt.extend_from_slice(&salt);
     pkt.extend_from_slice(&chunk);
     let _ = sock.send_to(&pkt, dst).await;
+}
+
+/// Render a connection failure for the log, naming `MODE` as a suspect when the
+/// symptom warrants it.
+///
+/// A wrong PSK and a `MODE` mismatch are indistinguishable on the wire — both
+/// derive the wrong key, so both surface as a failed AEAD open. Operators
+/// reliably read that as "bad PSK" and never suspect the mode, so spell the other
+/// cause out. Formats with `{:#}` to keep anyhow's whole chain, which plain
+/// `Display` would truncate to the outermost context.
+fn handshake_error_message(e: &anyhow::Error, mode: Mode) -> String {
+    const MISMATCH_SIGNATURES: [&str; 2] =
+        ["header authentication failed", "v6 first-frame timeout"];
+    let looks_like_mismatch = e.chain().any(|c| {
+        MISMATCH_SIGNATURES
+            .iter()
+            .any(|s| c.to_string().contains(s))
+    });
+    if !looks_like_mismatch {
+        return format!("{e:#}");
+    }
+    let hint = match mode {
+        Mode::Default => {
+            "server is on MODE=default (v6 shaped); a peer on v5 or MODE=unshaped cannot authenticate"
+        }
+        Mode::Unshaped => {
+            "server is on MODE=unshaped (the v5 wire); a peer on Surge v6 or MODE=default cannot authenticate"
+        }
+        Mode::UnsafeRaw => "server is on MODE=unsafe-raw and expects plaintext framing",
+    };
+    format!("{e:#} — check the PSK, then check MODE: {hint}")
 }
 
 #[allow(clippy::too_many_arguments)]

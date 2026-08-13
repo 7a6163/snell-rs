@@ -1,6 +1,6 @@
 [package]
 name = "snell-rs"
-version = "6.0.0"
+version = "6.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Open-source Snell v5/v6 proxy protocol implementation"

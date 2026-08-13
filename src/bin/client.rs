@@ -63,11 +63,12 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
 
     // v6 encryption mode (must match the server; not negotiated on the wire).
-    // Unset defaults to `unshaped`, the v5 wire this client has always spoken.
+    // Unset follows the official default, `default`; talking to a v5 server needs
+    // an explicit `MODE=unshaped`.
     let mode = match std::env::var("MODE") {
         Ok(s) => Mode::parse(&s)
             .ok_or_else(|| anyhow::anyhow!("invalid MODE '{s}' (default|unshaped|unsafe-raw)"))?,
-        Err(_) => Mode::Unshaped,
+        Err(_) => Mode::default(),
     };
 
     let ln = TcpListener::bind(listen).await?;
@@ -76,7 +77,10 @@ async fn main() -> Result<()> {
         Mode::Unshaped => "v5 / v6-unshaped",
         Mode::UnsafeRaw => "v6/unsafe-raw",
     };
-    eprintln!("Snell SOCKS5 proxy  {listen} → {server}  [{mode_label}]");
+    eprintln!(
+        "snell-client {} SOCKS5 proxy  {listen} → {server}  [{mode_label}]",
+        env!("CARGO_PKG_VERSION")
+    );
     if tfo_out {
         eprintln!("<NOTIFY> TCP Fast Open enabled (outbound)");
     }

@@ -104,6 +104,12 @@ pub fn spawn_server_with_envs(
         // production default. Tests that want to verify the rate limiter pass
         // an override in `extra_env` — Command::env is last-write-wins.
         .env("TCP_HANDSHAKE_COOLDOWN_MS", "0")
+        // Most suites exercise the v5 wire (obfs auto-detect, UoT, CONNECT
+        // paths), which is `unshaped`. The production default is `default`
+        // (shaped) to match official snell-server, so pin it here rather than
+        // leaning on whatever the unset default happens to be. Tests covering
+        // other modes pass MODE in `extra_env` — Command::env is last-write-wins.
+        .env("MODE", "unshaped")
         .kill_on_drop(true);
     // Note: as of v5.2.0 the SSRF guard is off by default, so we no longer need
     // to set BLOCK_PRIVATE_TARGETS=0 — proxying to 127.0.0.1 just works.
@@ -130,6 +136,8 @@ pub fn spawn_client_with_envs(
     cmd.env("PSK", PSK)
         .env("SNELL_SERVER", format!("127.0.0.1:{server_port}"))
         .env("LISTEN", format!("127.0.0.1:{socks_port}"))
+        // Mirror spawn_server_with_envs: default to the v5 wire, let callers override.
+        .env("MODE", "unshaped")
         .kill_on_drop(true);
     for (k, v) in extra_env {
         cmd.env(k, v);

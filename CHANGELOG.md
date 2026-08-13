@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.0] - 2026-08-13
+
+### Changed
+
+- **BREAKING:** an unset `MODE` now means `default` (v6 shaped) instead of
+  `unshaped`, matching official snell-server, whose help text reads
+  "Default: default." and whose `default` is the zero-valued enum variant a
+  zero-initialised config yields. **Serving a v5 client now requires an explicit
+  `MODE=unshaped`.** Deviating from the reference implementation on its most
+  visible default was a wart, and it cost real debugging time: a Surge client on
+  v6 against an unset-`MODE` server fails with `header authentication failed`,
+  which reads like a PSK problem.
+- `MODE` parsing is now ASCII case-insensitive, matching the official server's
+  `strcasecmp`. `MODE=Default` used to abort startup.
+
+### Added
+
+- The startup banner now reports the crate version, so a running container's
+  build is legible from the first line of its log:
+  `snell-server 6.1.0 listening on 0.0.0.0:6180  [v6/default (shaped)]`.
+- A failed handshake now names `MODE` as a suspect alongside the PSK. The two are
+  indistinguishable on the wire — both derive the wrong key and fail the same
+  AEAD open — so the log spells out which mode the server is in and which peers
+  cannot authenticate against it.
+- `compose.yml` now passes through every environment variable the README
+  documents; `MODE` and `DNS_IP_PREFERENCE` were previously unreachable for
+  Compose users, making the new v6 features impossible to enable that way.
+
 ## [6.0.0] - 2026-08-13
 
 ### Changed
@@ -157,6 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - End-to-end integration tests for TCP and QUIC; CI with static musl binaries and
   a multi-arch Docker image.
 
+[6.1.0]: https://github.com/7a6163/snell-rs/compare/v6.0.0...v6.1.0
 [6.0.0]: https://github.com/7a6163/snell-rs/compare/v5.6.0...v6.0.0
 [6.0.0-rc.1]: https://github.com/7a6163/snell-rs/compare/v5.6.0...v6.0.0-rc.1
 [5.6.0]: https://github.com/7a6163/snell-rs/compare/v5.5.0...v5.6.0

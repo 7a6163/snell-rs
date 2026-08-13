@@ -8,10 +8,19 @@ services:
       - "${PORT:-6180}:6180/udp"
     environment:
       PSK: ${PSK:?PSK required (min 16 chars)}
+      # Unset means `default` (v6 shaped), matching official snell-server.
+      # Surge clients on v5 need MODE=unshaped here.
+      MODE: ${MODE:-}
       QUIC: ${QUIC:-0}
       EGRESS_INTERFACE: ${EGRESS_INTERFACE:-}
       IPV6: ${IPV6:-0}
+      DNS_IP_PREFERENCE: ${DNS_IP_PREFERENCE:-}
       DNS: ${DNS:-}
       BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-0}
+      TCP_FASTOPEN: ${TCP_FASTOPEN:-1}
+      TCP_FASTOPEN_OUT: ${TCP_FASTOPEN_OUT:-0}
+      TCP_HANDSHAKE_COOLDOWN_MS: ${TCP_HANDSHAKE_COOLDOWN_MS:-100}
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-}
     cap_add:
       - NET_RAW

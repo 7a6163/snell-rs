@@ -21,14 +21,21 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Parse a `mode` config value. Unknown strings return `None`.
+    /// Parse a `mode` config value. Matching is ASCII case-insensitive because
+    /// the official server compares with `strcasecmp`. Unknown strings return
+    /// `None`.
     pub fn parse(s: &str) -> Option<Mode> {
-        match s.trim() {
-            "default" => Some(Mode::Default),
-            "unshaped" => Some(Mode::Unshaped),
-            "unsafe-raw" => Some(Mode::UnsafeRaw),
-            _ => None,
+        let s = s.trim();
+        for (name, mode) in [
+            ("default", Mode::Default),
+            ("unshaped", Mode::Unshaped),
+            ("unsafe-raw", Mode::UnsafeRaw),
+        ] {
+            if s.eq_ignore_ascii_case(name) {
+                return Some(mode);
+            }
         }
+        None
     }
 }
 
@@ -53,6 +60,12 @@ mod tests {
         assert_eq!(Mode::parse("unshaped"), Some(Mode::Unshaped));
         assert_eq!(Mode::parse(" unsafe-raw "), Some(Mode::UnsafeRaw));
         assert_eq!(Mode::parse("bogus"), None);
+        // The official server compares with `strcasecmp`.
+        assert_eq!(Mode::parse("Default"), Some(Mode::Default));
+        assert_eq!(Mode::parse("UNSHAPED"), Some(Mode::Unshaped));
+        assert_eq!(Mode::parse("Unsafe-Raw"), Some(Mode::UnsafeRaw));
+        // Official help text reads "Default: default.", and its `default` is 0,
+        // which is also what a zero-initialised config struct yields.
         assert_eq!(Mode::default(), Mode::Default);
         assert_eq!(Mode::Default as u8, 0);
         assert_eq!(Mode::Unshaped as u8, 1);
