@@ -59,6 +59,11 @@ async fn socks5_connect(socks_port: u16, host: &str, target_port: u16) -> TcpStr
     s
 }
 
+/// The echo target prepends `ECHO:` to each read it services.
+fn recv_contains(recv: &[u8], needle: &[u8]) -> bool {
+    recv.starts_with(b"ECHO:") && recv.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Round-trip a payload through a proxy pair running the given `MODE`.
 async fn roundtrip_in_mode(mode: &str) {
     let echo_port = spawn_echo().await;
@@ -146,6 +151,140 @@ async fn mode_larger_payload_default_roundtrip() {
     assert!(got.starts_with(b"ECHO:"), "no ECHO: prefix");
     let z_count = got.iter().filter(|&&b| b == b'z').count();
     assert_eq!(z_count, payload.len(), "not all payload bytes echoed back");
+}
+
+/// A client that drops the TCP connection instead of sending the authenticated
+/// zero record is routine (aborted requests, reachability probes, a killed app).
+/// The shaped reader is mid-record-structure when that EOF lands, so this pins
+/// that the listener keeps accepting afterwards.
+#[tokio::test]
+#[serial_test::serial]
+async fn abrupt_disconnect_leaves_the_server_healthy() {
+    let echo_port = spawn_echo().await;
+    let server_port = random_tcp_port();
+    let socks_port = random_tcp_port();
+
+    let _server = spawn_server_with_envs(server_port, false, &[("MODE", "default")]);
+    wait_tcp(server_port).await;
+    let _client = spawn_client_with_envs(server_port, socks_port, &[("MODE", "default")]);
+    wait_tcp(socks_port).await;
+
+    // A bare connect-and-close, before any handshake byte is sent.
+    drop(
+        TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap(),
+    );
+
+    // A partial first frame, then gone.
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        s.write_all(&[0x41; 40]).await.unwrap();
+    }
+
+    // A real session torn down mid-stream without a zero record.
+    {
+        let mut stream = socks5_connect(socks_port, "127.0.0.1", echo_port).await;
+        stream.write_all(b"then-vanish").await.unwrap();
+        let mut buf = vec![0u8; 128];
+        let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("read failed");
+        assert!(recv_contains(&buf[..n], b"then-vanish"));
+    }
+
+    // The server must still serve a fresh connection normally.
+    let mut stream = socks5_connect(socks_port, "127.0.0.1", echo_port).await;
+    stream.write_all(b"still-alive").await.unwrap();
+    let mut buf = vec![0u8; 128];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("server stopped responding after an abrupt disconnect")
+        .expect("read failed");
+    assert!(
+        recv_contains(&buf[..n], b"still-alive"),
+        "server did not recover from an abrupt disconnect"
+    );
+}
+
+/// The classification itself, asserted against the server's own log output.
+///
+/// A silent probe must not be reported, but a `MODE` mismatch must be — and both
+/// arrive as an EOF or reset from a `read_exact`, so anything that keys off the
+/// io error kind alone silences the mismatch along with the probe. That is a real
+/// regression this repo shipped once; only a test at this level catches it,
+/// because the unit tests cannot see which phase the call site was in.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_mode_mismatch_is_reported_but_a_silent_probe_is_not() {
+    let server_port = random_tcp_port();
+    let socks_port = random_tcp_port();
+    // `debug` so the benign classification is visible as a positive assertion
+    // rather than only as the absence of an ERROR, which an empty capture would
+    // satisfy for free.
+    let (_server, mut logs) =
+        spawn_server_capturing_logs(server_port, &[("MODE", "default"), ("RUST_LOG", "debug")]);
+    wait_tcp(server_port).await;
+
+    // Silent probes: connect, say nothing, close.
+    for _ in 0..3 {
+        drop(
+            TcpStream::connect(("127.0.0.1", server_port))
+                .await
+                .unwrap(),
+        );
+    }
+    let quiet = drain_logs(&mut logs, Duration::from_millis(600)).await;
+    assert!(
+        quiet.contains("connection closed early"),
+        "a silent probe should be recorded as a benign close, got:\n{quiet}"
+    );
+    assert!(
+        !quiet.contains("ERROR"),
+        "a silent probe must not be reported as a failure, got:\n{quiet}"
+    );
+
+    // A peer that spoke and then stopped short is the sharp case: it fails with
+    // the very same `UnexpectedEof` as the silent probe, so only a phase-aware
+    // classification can keep it loud. Matching on the io error kind buried it.
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        s.write_all(&[0x41; 40]).await.unwrap();
+        s.flush().await.unwrap();
+    }
+    let truncated = drain_logs(&mut logs, Duration::from_millis(600)).await;
+    assert!(
+        truncated.contains("ERROR"),
+        "a truncated handshake must be reported, got:\n{truncated}"
+    );
+
+    // Same PSK, wrong MODE: the operator must be told, and told to suspect MODE.
+    let echo_port = spawn_echo().await;
+    let _client = spawn_client_with_envs(server_port, socks_port, &[("MODE", "unshaped")]);
+    wait_tcp(socks_port).await;
+    let mut s = socks5_connect(socks_port, "127.0.0.1", echo_port).await;
+    // The v5 client pipelines its salt and first sealed chunk. Send enough that
+    // the shaped server's PSK-sized first-frame read is certainly satisfied, so
+    // the mismatch fails the AEAD promptly instead of idling to the 10 s
+    // handshake timeout. Both are reported; only this way is the test quick.
+    let _ = s.write_all(&vec![b'x'; 8192]).await;
+    let mut sink = [0u8; 64];
+    let _ = timeout(Duration::from_secs(3), s.read(&mut sink)).await;
+
+    let loud = drain_logs(&mut logs, Duration::from_millis(900)).await;
+    assert!(
+        loud.contains("ERROR"),
+        "a MODE mismatch must be reported at ERROR, got:\n{loud}"
+    );
+    assert!(
+        loud.contains("MODE"),
+        "the report must name MODE as a suspect, got:\n{loud}"
+    );
 }
 
 #[tokio::test]

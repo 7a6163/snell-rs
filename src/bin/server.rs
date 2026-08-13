@@ -338,11 +338,17 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
             )
             .await
             {
-                tracing::error!(
-                    %peer,
-                    error = %handshake_error_message(&e, mode),
-                    "connection failed"
-                );
+                if is_peer_disconnect(&e) {
+                    // Neutral wording: either side may have hung up, and the
+                    // joined relay error does not say which.
+                    tracing::debug!(%peer, error = %format!("{e:#}"), "connection closed early");
+                } else {
+                    tracing::error!(
+                        %peer,
+                        error = %handshake_error_message(&e, mode),
+                        "connection failed"
+                    );
+                }
             }
         });
     }
@@ -724,6 +730,66 @@ async fn send_quic_error(sock: &tokio::net::UdpSocket, dst: SocketAddr, psk: &[u
     let _ = sock.send_to(&pkt, dst).await;
 }
 
+/// A peer that connected and closed without sending a single byte.
+///
+/// Deliberately narrow. Classifying by *phase* rather than by io error kind is
+/// what keeps this honest: an EOF or reset is only uninteresting before the peer
+/// has said anything, or after a tunnel is established. In between — the whole
+/// handshake window — the same io error kinds are exactly how a wrong PSK or a
+/// `MODE` mismatch shows up on a peer that hangs up rather than waiting for a
+/// reply, so those must stay loud. An earlier version of this matched on
+/// `UnexpectedEof | ConnectionReset | BrokenPipe` anywhere in the error chain
+/// and silenced mid-handshake failures along with the probes.
+#[derive(Debug)]
+struct PeerNeverSpoke;
+
+impl std::fmt::Display for PeerNeverSpoke {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("peer closed without sending anything")
+    }
+}
+
+impl std::error::Error for PeerNeverSpoke {}
+
+/// Whether a connection ended before the peer ever spoke, which is routine on
+/// any listener (reachability probes, port scanners) and tells an operator
+/// nothing. Reporting these at ERROR buries the faults that do matter.
+fn is_peer_disconnect(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<PeerNeverSpoke>())
+}
+
+/// Whether an established session ended with one side hanging up rather than
+/// closing cleanly. Once a tunnel is up this is a normal way for it to end —
+/// aborted page loads, killed apps, and upstream targets that reset all land
+/// here — so the relay treats it as success instead of an error.
+fn is_session_teardown(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
+/// Fill `buf` completely, distinguishing a peer that never spoke from one that
+/// spoke and stopped. A truncated handshake is a real symptom and keeps its
+/// `UnexpectedEof`; a silent connect-and-close does not.
+async fn read_handshake_exact<R: AsyncReadExt + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]).await? {
+            0 if filled == 0 => return Err(anyhow::Error::new(PeerNeverSpoke)),
+            0 => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            n => filled += n,
+        }
+    }
+    Ok(())
+}
+
 /// Render a connection failure for the log, naming `MODE` as a suspect when the
 /// symptom warrants it.
 ///
@@ -898,7 +964,7 @@ where
     let mut client_salt = [0u8; SALT_LEN];
     tokio::time::timeout(
         Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
-        conn.read_exact(&mut client_salt),
+        read_handshake_exact(&mut conn, &mut client_salt),
     )
     .await
     .map_err(|_| anyhow::anyhow!("salt-exchange timeout"))??;
@@ -1001,7 +1067,13 @@ where
         // t2c: target → client (adaptive chunk sizing, encrypt Snell chunks)
         let t2c = copy_t2c_adaptive(tr, cw, s2c);
 
-        let ((cr, c2s_new), (cw, s2c_new)) = tokio::try_join!(c2t, t2c)?;
+        let ((cr, c2s_new), (cw, s2c_new)) = match tokio::try_join!(c2t, t2c) {
+            Ok(v) => v,
+            // The tunnel was established, so a hang-up is how sessions normally
+            // end. The connection can no longer be reused either way.
+            Err(e) if is_session_teardown(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
         c2s = c2s_new;
         s2c = s2c_new;
@@ -1029,7 +1101,7 @@ async fn handle_v6_default(
     let mut frame = vec![0u8; profile.frame_len()];
     tokio::time::timeout(
         Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
-        conn.read_exact(&mut frame),
+        read_handshake_exact(&mut conn, &mut frame),
     )
     .await
     .map_err(|_| anyhow::anyhow!("v6 first-frame timeout"))??;
@@ -1135,8 +1207,13 @@ async fn handle_v6_default(
         write_zero_record(&mut cw, &mut s2c, &profile, &mut s2c_k).await?;
         Ok::<_, anyhow::Error>(())
     };
-    tokio::try_join!(c2t, t2c)?;
-    Ok(())
+    // The tunnel was established, so a hang-up from either side is how sessions
+    // normally end, not a fault worth reporting.
+    match tokio::try_join!(c2t, t2c) {
+        Ok(_) => Ok(()),
+        Err(e) if is_session_teardown(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// v6 `unsafe-raw` (plaintext) TCP CONNECT handler: no salt, KDF, or cipher.
@@ -1228,8 +1305,11 @@ async fn handle_unsafe_raw(
         write_unsafe_raw_zero(&mut cw).await?;
         Ok::<_, anyhow::Error>(())
     };
-    tokio::try_join!(c2t, t2c)?;
-    Ok(())
+    match tokio::try_join!(c2t, t2c) {
+        Ok(_) => Ok(()),
+        Err(e) if is_session_teardown(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Relay a Snell UDP-over-TCP session. Consumes the connection (no v5 reuse for
@@ -1336,6 +1416,83 @@ mod tests {
 
     fn v6(s: &str) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()), 443)
+    }
+
+    /// `read_handshake_exact` must separate a silent connect-and-close from a
+    /// truncated handshake: only the former is uninteresting. Everything else in
+    /// the handshake window has to stay loud, which is what the kind-matching
+    /// predecessor to this got wrong.
+    #[tokio::test]
+    async fn silent_probe_is_benign_but_truncated_handshake_is_not() {
+        // Closed with nothing sent.
+        let mut empty = std::io::Cursor::new(Vec::new());
+        let mut buf = [0u8; 32];
+        let e = read_handshake_exact(&mut empty, &mut buf)
+            .await
+            .expect_err("must fail: buffer was not filled");
+        assert!(is_peer_disconnect(&e), "a silent probe should be benign");
+
+        // Spoke, then stopped short.
+        let mut partial = std::io::Cursor::new(vec![0x41; 8]);
+        let e = read_handshake_exact(&mut partial, &mut buf)
+            .await
+            .expect_err("must fail: buffer was not filled");
+        assert!(
+            !is_peer_disconnect(&e),
+            "a truncated handshake is a symptom, not a probe"
+        );
+
+        // A filled buffer is not an error at all.
+        let mut full = std::io::Cursor::new(vec![0x41; 32]);
+        assert!(read_handshake_exact(&mut full, &mut buf).await.is_ok());
+        assert_eq!(buf, [0x41; 32]);
+    }
+
+    /// The faults an operator needs to see must not be classified as a probe.
+    /// A wrong PSK and a `MODE` mismatch both surface as a failed AEAD open, and
+    /// a mismatch can also surface as a handshake timeout; none may be demoted,
+    /// and the failed open must still name `MODE` as a suspect.
+    #[test]
+    fn real_faults_are_never_demoted() {
+        for e in [
+            anyhow::anyhow!("header authentication failed"),
+            anyhow::anyhow!("payload authentication failed"),
+            anyhow::anyhow!("v6 first-frame timeout"),
+            anyhow::anyhow!("salt replay detected"),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(!is_peer_disconnect(&e), "{e:#} must stay an ERROR");
+        }
+        assert!(
+            handshake_error_message(
+                &anyhow::anyhow!("header authentication failed"),
+                Mode::Default
+            )
+            .contains("MODE"),
+            "a failed open should still name MODE as a suspect"
+        );
+    }
+
+    /// Session teardown is judged separately from the probe check, and only the
+    /// relay consults it — after a tunnel exists, a hang-up is a normal ending.
+    #[test]
+    fn session_teardown_covers_hangups_only() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let e = anyhow::Error::from(std::io::Error::from(kind));
+            assert!(is_session_teardown(&e), "{kind:?} ends a session normally");
+        }
+        // A fault that is not a hang-up must still propagate out of the relay.
+        for e in [
+            anyhow::anyhow!("payload authentication failed"),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ] {
+            assert!(!is_session_teardown(&e), "{e:#} must propagate");
+        }
     }
 
     #[test]

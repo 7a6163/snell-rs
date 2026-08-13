@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.1] - 2026-08-14
+
+### Fixed
+
+- A peer that opened a connection and went away was reported as
+  `ERROR connection failed ... error=early eof`. Nothing had failed: reachability
+  probes and port scanners connect and close without speaking, and clients abort
+  established sessions instead of sending the authenticated zero record. Both
+  reach the same EOF out of a `read_exact`. On a public listener this is
+  continuous, and it buried the failures an operator can act on — a passing Surge
+  test alongside a log full of `ERROR` reads as a broken server.
+
+  A connection that closes before sending a byte is now logged at `debug` as
+  `connection closed early`, and a hang-up after the tunnel is established ends
+  the session normally. The classification is by connection *phase*, not by io
+  error kind: throughout the handshake window an EOF or reset keeps its `ERROR`
+  level and its PSK/`MODE` hint, because that is how a wrong PSK or a `MODE`
+  mismatch presents on a peer that hangs up instead of waiting for a reply.
+  Matching on error kind alone would have silenced those too.
+
+### Added
+
+- End-to-end coverage for disconnects in `default` mode: a bare connect and
+  close, a truncated first frame, and a live session torn down mid-stream without
+  a zero record, each followed by asserting the server still serves a fresh
+  connection. Plus assertions on the server's own log output, so that a genuine
+  `MODE` mismatch is still reported at `ERROR` while a silent probe is not —
+  the classification, not just the framing, is now pinned.
+
 ## [6.2.0] - 2026-08-13
 
 ### Fixed

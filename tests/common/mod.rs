@@ -122,6 +122,50 @@ pub fn spawn_server_with_envs(
     ChildGuard(cmd.spawn().expect("spawn snell-server"))
 }
 
+/// Spawn a server with its log stream captured, for tests that assert on what
+/// the server *reports* rather than on what it relays. Returns the guard plus a
+/// reader; drain it with [`drain_logs`].
+///
+/// `tracing_subscriber::fmt` writes to stdout, so that is the stream to pipe —
+/// the startup banner goes to stderr via `eprintln!` and is not captured here.
+pub fn spawn_server_capturing_logs(
+    listen_port: u16,
+    extra_env: &[(&str, &str)],
+) -> (ChildGuard, tokio::process::ChildStdout) {
+    let bin = env!("CARGO_BIN_EXE_snell-server");
+    let mut cmd = Command::new(bin);
+    cmd.arg(format!("0.0.0.0:{listen_port}"))
+        .env("PSK", PSK)
+        .env("TCP_HANDSHAKE_COOLDOWN_MS", "0")
+        .env("MODE", "unshaped")
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn snell-server");
+    let out = child.stdout.take().expect("piped stdout");
+    (ChildGuard(child), out)
+}
+
+/// Read whatever the server has logged so far. Stops once no further output
+/// arrives within `quiet_for`, since the server never closes the stream while it
+/// is running.
+pub async fn drain_logs(out: &mut tokio::process::ChildStdout, quiet_for: Duration) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    let mut acc = Vec::new();
+    loop {
+        match tokio::time::timeout(quiet_for, out.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => panic!("reading server logs failed: {e}"),
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&acc).into_owned()
+}
+
 pub fn spawn_client(server_port: u16, socks_port: u16) -> ChildGuard {
     spawn_client_with_envs(server_port, socks_port, &[])
 }
