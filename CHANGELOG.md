@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [6.0.0-rc.2] - 2026-08-09
+## [6.0.0] - 2026-08-13
 
 ### Changed
 
@@ -157,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - End-to-end integration tests for TCP and QUIC; CI with static musl binaries and
   a multi-arch Docker image.
 
+[6.0.0]: https://github.com/7a6163/snell-rs/compare/v5.6.0...v6.0.0
 [6.0.0-rc.1]: https://github.com/7a6163/snell-rs/compare/v5.6.0...v6.0.0-rc.1
 [5.6.0]: https://github.com/7a6163/snell-rs/compare/v5.5.0...v5.6.0
 [5.5.0]: https://github.com/7a6163/snell-rs/compare/v5.4.0...v5.5.0
