@@ -63,7 +63,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PSK` | ✅ | — | Pre-shared key |
+| `PSK` | ✅ | — | Pre-shared key, 16-255 bytes. Official snell-server accepts 12-255; the floor is higher here because the protocol's argon2id parameters cannot stretch a short key |
 | `MODE` | — | `default` | v6 encryption mode: `default` (shaped), `unshaped` (v5 wire), or `unsafe-raw` (plaintext). Case-insensitive. Must match the client — **a v5 client needs `MODE=unshaped`**. See [v6 Encryption Modes](#v6-encryption-modes) |
 | `EGRESS_INTERFACE` | — | system default | Bind outgoing connections to this interface |
 | `IPV6` | — | `0` | Official `ipv6=` flag: a leading `t`/`T`/`y`/`Y`/`1` allows both IPv4 and IPv6 targets; anything else (and unset) is IPv4-only egress. Default off, matching official snell-server `ipv6=false` |
@@ -273,7 +273,7 @@ systemctl enable --now snell.socket
 
 ## Security
 
-- `PSK` is required — the server exits with an error if unset
+- `PSK` is required, 16-255 bytes — the server exits with an error if unset or out of range
 - Generate a strong PSK: `openssl rand -base64 32`
 
 ## Disclaimer

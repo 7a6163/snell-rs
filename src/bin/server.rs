@@ -3,7 +3,8 @@
 //! Default listen: 0.0.0.0:6180
 //!
 //! Environment variables:
-//!   PSK                   Pre-shared key (required, min 16 chars)
+//!   PSK                   Pre-shared key (required, 16-255 bytes; official
+//!                         snell-server allows 12-255)
 //!   EGRESS_INTERFACE      Bind outgoing connections to this network interface
 //!   IPV6                  Official `ipv6=` flag: a leading t/T/y/Y/1 allows both
 //!                         families, anything else (and unset) is IPv4-only egress.
@@ -144,9 +145,7 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
 
     let psk_str = std::env::var("PSK")
         .map_err(|_| anyhow::anyhow!("PSK environment variable is required"))?;
-    if psk_str.len() < 16 {
-        anyhow::bail!("PSK must be at least 16 bytes (got {})", psk_str.len());
-    }
+    snell::cipher::validate_psk(psk_str.as_bytes())?;
     // T2-G: Wrap in Zeroizing so the PSK bytes are scrubbed when the Arc's
     // final clone is dropped (best-effort defense against core dumps / swap).
     let psk: Psk = Arc::new(Zeroizing::new(psk_str.into_bytes()));

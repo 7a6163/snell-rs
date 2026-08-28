@@ -17,6 +17,42 @@ use rand::RngCore;
 pub const SALT_LEN: usize = 16;
 pub const HDR_CT_LEN: usize = 23; // 7-byte header PT + 16-byte GCM tag
 
+/// Accepted PSK length, in bytes.
+///
+/// Official snell-server v6.0.0rc2 accepts 12..=255 ("Parameter 'psk' length
+/// must be between %d and %d bytes."). We raise the floor to 16 and keep the
+/// official ceiling:
+///
+/// * The floor is deliberately stricter. The protocol pins argon2id to
+///   `m=8 KiB, t=3, p=1`, which is far too weak to stretch a short key, so the
+///   PSK has to carry its own entropy — `openssl rand -base64 32`, not a
+///   passphrase. A 12-byte PSK is accepted by official and rejected here.
+/// * The ceiling exists for configuration compatibility only: official refuses
+///   to start above 255, so anything longer is a key that cannot be carried to
+///   an official deployment. It has no wire-level effect — the v6 profile is
+///   derived from `blake2b(psk)`, not from the PSK's length, so a longer key
+///   would interoperate fine between two snell-rs peers.
+pub const PSK_MIN_LEN: usize = 16;
+/// See [`PSK_MIN_LEN`].
+pub const PSK_MAX_LEN: usize = 255;
+
+/// Check a configured PSK against [`PSK_MIN_LEN`]..=[`PSK_MAX_LEN`]. Both
+/// binaries call this at startup so a key that is out of range fails loudly
+/// there rather than as an authentication failure on the first connection.
+pub fn validate_psk(psk: &[u8]) -> Result<()> {
+    match psk.len() {
+        n if n < PSK_MIN_LEN => bail!(
+            "PSK must be at least {PSK_MIN_LEN} bytes (got {n}). Official snell-server \
+             accepts 12, but the protocol's argon2id parameters are too weak to stretch \
+             a short key — generate one with `openssl rand -base64 32`"
+        ),
+        n if n > PSK_MAX_LEN => bail!(
+            "PSK must be at most {PSK_MAX_LEN} bytes (got {n}), matching official snell-server"
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub struct SnellCipher {
     aead: Aes128Gcm,
     nonce: [u8; 12],
@@ -325,6 +361,20 @@ mod tests {
         // The exact boundary 0xffff is accepted.
         let at_limit = vec![0u8; 0xffff];
         assert!(c.seal(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn psk_length_bounds_match_the_documented_range() {
+        assert!(validate_psk(&[b'x'; PSK_MIN_LEN]).is_ok());
+        assert!(validate_psk(&[b'x'; PSK_MAX_LEN]).is_ok());
+        assert!(validate_psk(&[b'x'; PSK_MIN_LEN - 1]).is_err());
+        assert!(validate_psk(&[b'x'; PSK_MAX_LEN + 1]).is_err());
+        assert!(validate_psk(b"").is_err());
+        // A 12-byte PSK is valid for official snell-server and rejected here;
+        // the message has to say so or the operator has no idea why.
+        let e = validate_psk(&[b'x'; 12]).unwrap_err().to_string();
+        assert!(e.contains("at least 16"), "{e}");
+        assert!(e.contains("Official"), "{e}");
     }
 
     #[test]

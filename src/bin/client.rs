@@ -49,11 +49,12 @@ async fn main() -> Result<()> {
         .parse()?;
     // T2-G: Wrap in Zeroizing so the PSK bytes are scrubbed when the Arc's
     // final clone is dropped (best-effort defense against core dumps / swap).
-    let psk: Arc<Zeroizing<Vec<u8>>> = Arc::new(Zeroizing::new(
-        std::env::var("PSK")
-            .map_err(|_| anyhow::anyhow!("PSK environment variable is required"))?
-            .into_bytes(),
-    ));
+    let psk_str = std::env::var("PSK")
+        .map_err(|_| anyhow::anyhow!("PSK environment variable is required"))?;
+    // Same range as the server: a PSK that one end refuses is one the other end
+    // could only report as an authentication failure.
+    snell::cipher::validate_psk(psk_str.as_bytes())?;
+    let psk: Arc<Zeroizing<Vec<u8>>> = Arc::new(Zeroizing::new(psk_str.into_bytes()));
     let listen: SocketAddr = std::env::var("LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:1080".into())
         .parse()?;
