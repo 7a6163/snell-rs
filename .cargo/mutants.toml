@@ -1,0 +1,56 @@
+# cargo-mutants configuration -- read by default by `cargo mutants`.
+#
+# Mutation testing answers "would the tests notice if this code were wrong?".
+# It is deliberately not part of CI: a run rebuilds the tree once per mutant and
+# takes tens of minutes, so it belongs in an occasional deliberate pass.
+#
+#   cargo mutants                                    # everything in scope below
+#   cargo mutants --file src/v6/mix.rs               # one file
+#   cargo mutants --in-diff <(git diff origin/main)  # only what a branch changed
+
+# ── Test scope ───────────────────────────────────────────────────────────────
+# Unit tests only. They finish in ~0.15s; the full suite takes ~20s, which would
+# put one run past five hours. The integration tests also spawn real binaries and
+# bind real ports, and one deliberately waits out a 10s handshake timeout.
+#
+# The cost is that anything reached only by an integration test goes unmeasured;
+# that is what the exclude_re below is about.
+additional_cargo_test_args = ["--lib", "--bins"]
+
+# Mutants that replace a whole function with `Ok(())` tend to make a test hang
+# rather than fail -- a reader that never returns, a writer that emits nothing.
+# Without a ceiling, one such mutant stalls the whole run.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+# Thin wrappers over setsockopt / sd_listen_fds / tracing. They have no unit
+# tests and cannot usefully get any -- the behaviour worth testing belongs to the
+# kernel or to systemd. Every mutant here survives, which says nothing about the
+# test suite, and leaving them in buries the survivors that do mean something.
+exclude_globs = [
+    "src/egress.rs",
+    "src/tfo.rs",
+    "src/activation.rs",
+    "src/logging.rs",
+]
+
+# Connection handlers and entry points, reached only by the integration tests
+# that the scope above excludes. Their mutants would survive for a reason that
+# has nothing to do with test quality. The pure functions beside them in the same
+# files -- is_safe_target, cooldown_check_and_insert, read_handshake_exact, the
+# error classification, SaltSlot -- do have unit tests and stay in scope.
+#
+# If one of these is renamed its mutants reappear as survivors rather than
+# vanishing silently, which is the right direction for this to drift.
+exclude_re = [
+    "\\b(main|async_main|async_main_inner|dispatch|handle|handle_v6_default|handle_unsafe_raw|handle_quic_init|relay_udp|run_udp_relay|forward_udp_frame|absorb_http_request|spawn_udp_listener|send_quic_error|make_tls_acceptor|apply_listen_tfo)\\b",
+]
+
+# Deliberately NOT excluded: the surviving mutants in `parse_request`. They are
+# equivalent mutants -- original and mutant both return Err, differing only in
+# which message -- so no test can kill them, and the reason is recorded at the
+# function itself. Silencing them here would need a regex that also discards the
+# mutants in that function the tests do kill, turning a measured result into an
+# unmeasured one. A known survivor count carries information; zeroing it out by
+# configuration does not.

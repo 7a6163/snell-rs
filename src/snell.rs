@@ -119,6 +119,14 @@ pub struct SnellRequest {
 }
 
 /// Parse a decrypted Snell v5 handshake payload.
+///
+/// The two truncation checks below survive mutation testing (`<` to `<=` or
+/// `==`, `+` to `*` or `-`) and no test can kill them: those mutations change
+/// only *which* error comes back, never whether one does. A buffer short enough
+/// to reach a mutated comparison fails the next check anyway, and a buffer long
+/// enough to parse satisfies both forms of every check. They are recorded here
+/// rather than silenced in `.cargo/mutants.toml`, because no regex isolates them
+/// from the mutants in this function that the tests do kill.
 pub fn parse_request(data: &[u8]) -> Result<SnellRequest> {
     if data.len() < 3 {
         bail!("request too short");
