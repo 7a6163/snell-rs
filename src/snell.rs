@@ -164,6 +164,22 @@ pub fn parse_request(data: &[u8]) -> Result<SnellRequest> {
 }
 
 /// Read and decrypt one complete chunk. Returns `None` on zero chunk.
+///
+/// The interleave region between the header and the payload ciphertext is
+/// skipped, never transformed. An earlier version un-swapped even bytes across
+/// it, undoing a sender-side swap that exists nowhere: [`SnellCipher::seal`]
+/// always emits `interleave = 0`, and the only writer that fills the region is
+/// v6's shaped record layer, whose reader undoes the real PSK-derived
+/// involution instead (`v6::Profile::mix`, recovered from the official binary).
+/// That even-byte swap was the same invented transform removed from
+/// [`crate::v6::unsafe_raw`] in 6.2.0, where it would have corrupted any frame
+/// a peer sent with a non-empty region. Skipping matches the other two readers
+/// of this layout, `v6::read_unsafe_raw` and `quic::decrypt_init`.
+///
+/// Official rc2's non-shaped chunk writer allocates `7 + payload_len` with no
+/// room for an interleave region, so nothing suggests a v5 peer sends one. What
+/// its *reader* does with one was not settled, which is why this skips rather
+/// than guessing at a replacement transform.
 pub async fn read_chunk<R: AsyncReadExt + Unpin>(
     r: &mut R,
     cipher: &mut SnellCipher,
@@ -171,25 +187,19 @@ pub async fn read_chunk<R: AsyncReadExt + Unpin>(
     let mut hdr_ct = [0u8; HDR_CT_LEN];
     r.read_exact(&mut hdr_ct).await?;
 
-    let Some((interleave, payload_len)) = cipher.open_header(&hdr_ct)? else {
+    let (interleave, payload_len) = cipher.open_header_raw_with_aad(&hdr_ct, &[])?;
+
+    if payload_len == 0 {
+        // A zero chunk still advertises its interleave region, and leaving those
+        // bytes on the wire desynchronises everything read after it. `v6`'s
+        // reader had the same defect, fixed in 6.2.0; this path kept its copy.
+        r.read_exact(&mut vec![0u8; interleave]).await?;
         return Ok(None);
-    };
-
-    let total = interleave + payload_len + 16;
-    let mut buf = vec![0u8; total];
-    r.read_exact(&mut buf).await?;
-
-    // Un-interleave: undo the even-byte swap applied by sender
-    if interleave > 0 {
-        let n = interleave.min(payload_len + 16);
-        for i in (0..n).step_by(2) {
-            buf.swap(i, interleave + i);
-        }
     }
 
-    cipher
-        .open_payload(&buf[interleave..interleave + payload_len + 16])
-        .map(Some)
+    let mut buf = vec![0u8; interleave + payload_len + 16];
+    r.read_exact(&mut buf).await?;
+    cipher.open_payload(&buf[interleave..]).map(Some)
 }
 
 /// Encrypt `data` as chunks and write to `w` (splits at 16383 bytes if needed).
@@ -683,6 +693,30 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = rend.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "empty payload must produce zero on-wire bytes");
+    }
+
+    /// A zero chunk still advertises an interleave region. Leaving those bytes
+    /// unread desynchronises whatever follows -- the defect fixed in the v6
+    /// reader in 6.2.0, which this path had kept its own copy of.
+    #[tokio::test]
+    async fn zero_chunk_drains_its_interleave_region() {
+        let (mut tx, mut rx) = cipher_pair();
+        let mut wire = tx.seal(b"first").unwrap();
+        // Terminator advertising 7 junk bytes, followed by those bytes.
+        wire.extend_from_slice(&tx.seal_zero_with_junk(&[], 7).unwrap());
+        wire.extend_from_slice(&[0xEEu8; 7]);
+
+        let mut r = &wire[..];
+        assert_eq!(
+            read_chunk(&mut r, &mut rx).await.unwrap().unwrap(),
+            b"first"
+        );
+        assert!(read_chunk(&mut r, &mut rx).await.unwrap().is_none());
+        assert!(
+            r.is_empty(),
+            "the terminator's interleave region must be consumed, {} bytes left",
+            r.len()
+        );
     }
 
     #[tokio::test]
