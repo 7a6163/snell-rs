@@ -92,6 +92,7 @@ async fn assert_tunnel_echoes(server_port: u16, host: &str, target_port: u16) {
 // ── literal targets blocked by an *-only policy ───────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv4_only_rejects_ipv6_literal() {
     // Neither IPV6 nor DNS_IP_PREFERENCE set → ipv4-only, the default.
     let server_port = random_tcp_port();
@@ -103,6 +104,7 @@ async fn ipv4_only_rejects_ipv6_literal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv6_only_rejects_ipv4_literal() {
     let server_port = random_tcp_port();
     let _server = spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv6-only")]);
@@ -113,6 +115,7 @@ async fn ipv6_only_rejects_ipv4_literal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv4_only_rejects_bracketed_ipv6_literal() {
     // The bracketed spelling must take the same literal fast path.
     let server_port = random_tcp_port();
@@ -126,6 +129,7 @@ async fn ipv4_only_rejects_bracketed_ipv6_literal() {
 // ── literal targets permitted by the policy ──────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv4_only_allows_ipv4_literal() {
     let echo_port = spawn_echo_on("127.0.0.1:0").await.expect("bind v4 echo");
     let server_port = random_tcp_port();
@@ -136,6 +140,7 @@ async fn ipv4_only_allows_ipv4_literal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv6_only_allows_ipv6_literal() {
     let Some(echo_port) = spawn_echo_on("[::1]:0").await else {
         eprintln!("skipping: no IPv6 loopback on this host");
@@ -149,6 +154,7 @@ async fn ipv6_only_allows_ipv6_literal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn prefer_and_default_policies_allow_ipv6_literal() {
     // prefer-* must never gate a literal — only the *-only policies do.
     let Some(echo_port) = spawn_echo_on("[::1]:0").await else {
@@ -166,6 +172,7 @@ async fn prefer_and_default_policies_allow_ipv6_literal() {
 // ── DNS_IP_PREFERENCE overrides IPV6 regardless of value ─────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn preference_overrides_unset_ipv6_flag() {
     // IPV6 unset (would be ipv4-only) + ipv6-only → the IPv4 literal is blocked.
     let server_port = random_tcp_port();
@@ -177,6 +184,7 @@ async fn preference_overrides_unset_ipv6_flag() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn preference_overrides_ipv6_zero() {
     // IPV6=0 alone means ipv4-only, but an explicit preference wins: the IPv6
     // literal must connect.
@@ -196,6 +204,7 @@ async fn preference_overrides_ipv6_zero() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn preference_overrides_ipv6_true() {
     // The override works in the other direction too: IPV6=true would allow both
     // families, but ipv4-only still blocks the IPv6 literal.
@@ -212,6 +221,7 @@ async fn preference_overrides_ipv6_true() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn ipv6_flag_true_allows_ipv6_literal() {
     // IPV6 with a true-like value maps to the `default` policy.
     let Some(echo_port) = spawn_echo_on("[::1]:0").await else {
@@ -228,6 +238,7 @@ async fn ipv6_flag_true_allows_ipv6_literal() {
 // ── error codes ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn unresolvable_domain_reports_dns_failed() {
     let server_port = random_tcp_port();
     let _server = spawn_server(server_port, false);
@@ -240,6 +251,7 @@ async fn unresolvable_domain_reports_dns_failed() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn refused_connect_reports_econnrefused() {
     let closed = random_tcp_port(); // bound then dropped → connect is refused
     let server_port = random_tcp_port();
@@ -256,6 +268,7 @@ async fn refused_connect_reports_econnrefused() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn invalid_preference_value_aborts_startup() {
     let server_port = random_tcp_port();
     let mut server = spawn_server_with_envs(server_port, false, &[("DNS_IP_PREFERENCE", "ipv7")]);

@@ -27,6 +27,7 @@ async fn spawn_udp_echo() -> u16 {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_replies_pong_to_ping() {
     let server_port = random_tcp_port();
     let _server = spawn_server(server_port, false);
@@ -41,6 +42,7 @@ async fn server_replies_pong_to_ping() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_sends_error_when_target_refuses() {
     let server_port = random_tcp_port();
     let closed = random_udp_port(); // bound then dropped → connect is refused
@@ -58,6 +60,7 @@ async fn server_sends_error_when_target_refuses() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_rejects_unknown_command() {
     let server_port = random_tcp_port();
     let _server = spawn_server(server_port, false);
@@ -76,6 +79,7 @@ async fn server_rejects_unknown_command() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn server_udp_relays_datagram_to_echo() {
     let echo_port = spawn_udp_echo().await;
     let server_port = random_tcp_port();
@@ -110,6 +114,7 @@ async fn server_udp_relays_datagram_to_echo() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn quic_survives_malformed_init() {
     let server_port = random_tcp_port();
     let _server = spawn_server(server_port, true);

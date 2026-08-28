@@ -15,18 +15,45 @@ use tokio::time::sleep;
 pub const PSK: &str = "integration-test-psk-32-bytes--";
 // Length 31. Server enforces >= 16.
 
+/// Test ports are drawn from a range the OS never assigns on its own.
+///
+/// The previous implementation bound `:0`, recorded the port and dropped the
+/// listener, leaving it free for the server under test -- and equally free for
+/// anything else drawing from the same ephemeral pool, including another
+/// integration binary doing exactly this microseconds later. Kernels prefer to
+/// hand back a just-freed ephemeral port, so the collision was likely rather
+/// than theoretical: it surfaced as `wait_tcp` timing out, or a handshake that
+/// never got a reply, in a different test each run.
+///
+/// `#[serial_test::serial]` cannot fix it, because that lock is per process and
+/// cargo runs the integration binaries concurrently. Moving out of the
+/// contended pool can: 20000..32000 sits below Linux's default ephemeral floor
+/// (32768) and far below macOS's (49152), so nothing but another test process
+/// competes for it, and the bind check below rejects a port one already took.
+const PORT_LO: u16 = 20_000;
+const PORT_HI: u16 = 32_000;
+
+fn free_port(udp: bool) -> u16 {
+    for _ in 0..500 {
+        let port = PORT_LO + rand::random::<u16>() % (PORT_HI - PORT_LO);
+        let free = if udp {
+            std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        } else {
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        };
+        if free {
+            return port;
+        }
+    }
+    panic!("no free port in {PORT_LO}..{PORT_HI}");
+}
+
 pub fn random_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    free_port(false)
 }
 
 pub fn random_udp_port() -> u16 {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = socket.local_addr().unwrap().port();
-    drop(socket);
-    port
+    free_port(true)
 }
 
 pub async fn wait_tcp(port: u16) {

@@ -26,6 +26,7 @@ async fn spawn_udp_echo() -> u16 {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn udp_e2e_socks5_associate_echo() {
     let echo_port = spawn_udp_echo().await;
     let server_port = random_tcp_port();

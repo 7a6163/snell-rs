@@ -68,6 +68,7 @@ async fn quic_parse_request_rejects_bad_command() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn quic_e2e_init_data_response() {
     let echo_port = spawn_udp_echo().await;
     let server_port = random_tcp_port();
