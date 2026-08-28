@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.3.1] - 2026-08-28
+
+### Fixed
+
+- **The v5 chunk reader mishandled the interleave region, in two ways.** A zero
+  chunk still advertises an interleave region, and the reader returned
+  end-of-session without consuming those bytes — desynchronising everything read
+  after the terminator. This is the same defect fixed in the v6 reader in 6.2.0;
+  the v5 path kept its own copy of it, and it is the more serious of the two
+  because it corrupts a stream rather than a single chunk.
+
+  The data path un-swapped even bytes across the region, undoing a sender-side
+  swap that exists nowhere. `seal` always emits `interleave = 0`, and the only
+  writer that fills the region is v6's shaped record layer, whose reader undoes
+  the real PSK-derived involution instead. That even-byte swap is the same
+  invented transform removed from `unsafe-raw` in 6.2.0 — where the note reads
+  "would have silently corrupted any frame a peer sent with a non-empty
+  interleave" — and this path was missed in that sweep. The region is now
+  skipped, matching `v6::read_unsafe_raw` and `quic::decrypt_init`, the two
+  other readers of the same layout; all three now agree.
+
+  It is deliberately not replaced with a different transform. Official rc2's
+  non-shaped chunk writer allocates `7 + payload_len` with no room for an
+  interleave region, so nothing suggests a v5 peer sends one — but what its
+  *reader* does with one could not be settled from the available binaries, and
+  guessing is how the removed swap arrived in the first place.
+
+### Added
+
+- Test coverage for three gaps found by running `cargo-mutants` over the
+  unit-tested modules (187 mutants against `cargo test --lib`, the only part of
+  the suite fast enough to mutate; 31 survived, most of them equivalent mutants
+  or log-only paths):
+  - `connect_error` has an errno arm and an `err.kind()` fallback reached
+    whenever the io error carries no errno. Only the errno arm was tested, so
+    all five fallback arms could be deleted with the suite still green — a peer
+    would receive the wrong error code depending on how the error happened to be
+    constructed.
+  - `AdaptiveSizer::on_partial` was tested backing off from 2048, where halving
+    and flooring at `SIZER_MIN` give the same answer, so the test could not tell
+    the two apart. It now ramps to 4096 first.
+  - `copy_t2c_adaptive`'s wiring between a read's length and the ramp decision
+    had no test at all. Inverting it reverses the whole heuristic without losing
+    a byte — only the chunk sizes change, and those are the point of the module.
+
 ## [6.3.0] - 2026-08-28
 
 ### Security
