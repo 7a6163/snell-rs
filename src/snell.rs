@@ -220,11 +220,35 @@ pub async fn write_chunk_sized<W: AsyncWriteExt + Unpin>(
 
 // ── UDP-over-TCP (UoT) datagram framing ──────────────────────────────────────
 //
-// See PORTING_udp.md. One datagram = one Snell chunk (no inner length field).
-// The two directions are asymmetric:
-//   client → server: [0x01 opcode][addr][port BE][payload]
+// One datagram = one Snell chunk. There is no length field inside a frame: the
+// official server takes each frame's length from an array supplied by its chunk
+// reader, so the AEAD chunk boundary *is* the datagram boundary.
+//
+//   client → server: [0x01 command][addr][port BE][payload]
 //     addr = domain [len][bytes] | IPv4 [00 04][4] | IPv6 [00 06][16]
-//   server → client: [atyp 0x04|0x06][addr][port BE][payload]   (no opcode, IP-only)
+//     payload starts at 4+len (domain), 9 (IPv4), 21 (IPv6)
+//   server → client: [atyp 0x04|0x06][addr][port BE][payload]   (no command, IP-only)
+//
+// Verified against official snell-server v6.0.0rc2 by disassembly, not by
+// capture. The frame loop is fn `0x43210` on amd64 (`0x5255c` on aarch64); it
+// reads `frame[0]` as the command (only `0x01`; anything else logs "Unsupport
+// UDP command"), `frame[1]` as the domain length, and `frame[1] == 0` selects
+// the typed-IP form on `frame[2]` (`0x04`/`0x06`). The payload offsets above are
+// the literals `leaq 0x9(%r15)` / `leaq 0x15(%r15)` in the IPv4/IPv6 arms and
+// `frame + 2 + host_len + 2` in the domain arm; both builds agree.
+//
+// Three places the official parser differs, none of which this code copies:
+//   * Domain frames: rc2 requires `host_len + 4 < frame_len`, i.e. at least one
+//     payload byte, and drops a zero-payload datagram. We forward it.
+//   * IP-literal frames: rc2 bounds-checks nothing — it reads `frame[3..9]` /
+//     `frame[3..21]` whatever the frame length is. We reject truncation.
+//   * An address-type byte that is neither `0x04` nor `0x06`: rc2 falls through
+//     with a zeroed sockaddr and takes the payload from `frame[3]`. We reject it.
+//
+// The `CONNECT_UDP` request itself must occupy its own chunk with nothing
+// appended: rc2 compares the bytes its handshake parser consumed against the
+// first frame's length and rejects a mismatch with "Invalid UDP tunnel request"
+// (amd64 `0x42584`). `snell-client` already sends the 6-byte request alone.
 
 /// Per-datagram opcode prefixing every client→server UoT frame. Distinct from
 /// `CMD_CONNECT_UDP` (0x06), which only opens the session in the request header.
@@ -672,9 +696,12 @@ mod tests {
 
     // ---- UDP-over-TCP framing ------------------------------------------------
 
+    /// Layouts below are the ones official snell-server v6.0.0rc2 parses; see
+    /// the module comment for the disassembly they were read off.
     #[test]
     fn udp_request_ipv4_byte_layout_and_roundtrip() {
         // 1.2.3.4:53 with payload "hi" → 01 | 00 04 | 01020304 | 0035 | "hi"
+        // rc2 reads the port at frame[7] and the payload at frame[9].
         let wire = encode_udp_request("1.2.3.4", 53, b"hi");
         assert_eq!(wire, [0x01, 0x00, 0x04, 1, 2, 3, 4, 0x00, 0x35, b'h', b'i']);
         let req = parse_udp_request(&wire).unwrap();
@@ -685,9 +712,12 @@ mod tests {
 
     #[test]
     fn udp_request_ipv6_roundtrip() {
+        // rc2 reads the port at frame[19] and the payload at frame[21].
         let wire = encode_udp_request("2606:4700:4700::1111", 443, b"x");
         assert_eq!(wire[0], 0x01);
         assert_eq!(&wire[1..3], &[0x00, 0x06]);
+        assert_eq!(&wire[19..21], &443u16.to_be_bytes());
+        assert_eq!(&wire[21..], b"x");
         let req = parse_udp_request(&wire).unwrap();
         assert_eq!(
             req.host,
@@ -728,6 +758,22 @@ mod tests {
         assert!(parse_udp_request(&[0x01, 10, b'a', b'b']).is_err());
         // addr ok but missing port
         assert!(parse_udp_request(&[0x01, 0x00, 0x04, 1, 2, 3, 4]).is_err());
+    }
+
+    /// Deliberate divergence: rc2's domain arm requires `host_len + 4 <
+    /// frame_len` and silently drops a zero-payload datagram. A zero-length UDP
+    /// datagram is legal, so we forward it rather than copying that bound.
+    #[test]
+    fn udp_request_accepts_empty_payload_unlike_official() {
+        let wire = encode_udp_request("example.com", 443, b"");
+        let req = parse_udp_request(&wire).unwrap();
+        assert_eq!(req.host, "example.com");
+        assert_eq!(req.port, 443);
+        assert!(req.payload.is_empty());
+        // The IP-literal arm too, where rc2 bounds-checks nothing at all.
+        let wire = encode_udp_request("1.2.3.4", 53, b"");
+        assert_eq!(wire.len(), 9);
+        assert!(parse_udp_request(&wire).unwrap().payload.is_empty());
     }
 
     #[test]

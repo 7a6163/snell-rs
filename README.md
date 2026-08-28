@@ -63,7 +63,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PSK` | ✅ | — | Pre-shared key |
+| `PSK` | ✅ | — | Pre-shared key, 16-255 bytes. Official snell-server accepts 12-255; the floor is higher here because the protocol's argon2id parameters cannot stretch a short key |
 | `MODE` | — | `default` | v6 encryption mode: `default` (shaped), `unshaped` (v5 wire), or `unsafe-raw` (plaintext). Case-insensitive. Must match the client — **a v5 client needs `MODE=unshaped`**. See [v6 Encryption Modes](#v6-encryption-modes) |
 | `EGRESS_INTERFACE` | — | system default | Bind outgoing connections to this interface |
 | `IPV6` | — | `0` | Official `ipv6=` flag: a leading `t`/`T`/`y`/`Y`/`1` allows both IPv4 and IPv6 targets; anything else (and unset) is IPv4-only egress. Default off, matching official snell-server `ipv6=false` |
@@ -195,10 +195,11 @@ server-side honoring `IPV6` / `DNS_IP_PREFERENCE` / `DNS`, and the SSRF guard ap
 `snell-client` exposes this via **SOCKS5 UDP ASSOCIATE** — point a SOCKS5-UDP
 app at the client's `LISTEN` address and its datagrams tunnel through.
 
-> **Note:** the UoT wire format was implemented from the behaviour of the
-> open-source `opensnell` project and verified with an internal round-trip test;
-> it has not been validated byte-for-byte against an official Surge capture. No
-> server-side configuration is required.
+> **Note:** the UoT frame layout has been verified against official
+> snell-server v6.0.0rc2 by disassembling its frame parser on both amd64 and
+> aarch64 (see the UoT section of `src/snell.rs` for the addresses and for the
+> three places rc2's parser is deliberately not copied). It has not been checked
+> against a live Surge capture. No server-side configuration is required.
 
 ## QUIC Proxy Mode
 
@@ -272,7 +273,7 @@ systemctl enable --now snell.socket
 
 ## Security
 
-- `PSK` is required — the server exits with an error if unset
+- `PSK` is required, 16-255 bytes — the server exits with an error if unset or out of range
 - Generate a strong PSK: `openssl rand -base64 32`
 
 ## Disclaimer

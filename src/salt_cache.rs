@@ -10,6 +10,15 @@
 //! Mitigation: keep an LRU + TTL cache of seen salts. A repeat within
 //! the TTL window is rejected; after the window elapses the salt is
 //! eligible again (the attacker is rate-limited to 1 replay per TTL).
+//!
+//! The check has to happen before the argon2id KDF, so entry into the cache is
+//! necessarily unauthenticated. That alone would let anyone who can reach the
+//! listener flush the window with garbage salts — cheaply over QUIC, where the
+//! source address is spoofable and the per-IP cooldown therefore toothless.
+//! [`SaltCache::forget`] closes that: a salt that never authenticates a chunk
+//! gives its slot back, so only real sessions occupy the window. The insert
+//! stays atomic and up front, so concurrent replays of one captured salt still
+//! race against an entry that is already there.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -70,6 +79,14 @@ impl SaltCache {
         // salt gets a full new TTL window of protection.
         cache.put(*salt, now);
         true
+    }
+
+    /// Release a salt that turned out never to authenticate anything, so a
+    /// failed handshake costs no cache residency. Callers MUST only call this
+    /// when the peer failed to open a chunk under the key derived from this
+    /// salt — forgetting an authenticated salt would re-open the replay window.
+    pub fn forget(&self, salt: &Salt) {
+        self.inner.lock().pop(salt);
     }
 
     pub fn len(&self) -> usize {
@@ -144,6 +161,42 @@ mod tests {
         assert!(a.check_and_insert(&s));
         // b sees the same entry — replay through any clone is rejected.
         assert!(!b.check_and_insert(&s));
+    }
+
+    #[test]
+    fn forgotten_salt_is_accepted_again() {
+        let c = SaltCache::new();
+        let s = [0x5Au8; 16];
+        assert!(c.check_and_insert(&s));
+        assert!(!c.check_and_insert(&s), "still held before forget");
+        c.forget(&s);
+        assert!(c.check_and_insert(&s), "a released salt is fresh again");
+    }
+
+    /// The point of `forget`: garbage salts from peers that never authenticate
+    /// must not evict the salts of sessions that did.
+    #[test]
+    fn forgotten_salts_do_not_evict_authenticated_ones() {
+        let c = SaltCache::with_capacity(2, Duration::from_secs(60));
+        let real = [0xFFu8; 16]; // outside the junk range below
+        assert!(c.check_and_insert(&real));
+        // A flood of unauthenticated attempts, each released on failure.
+        for i in 0..50u8 {
+            let junk = [i; 16];
+            assert!(c.check_and_insert(&junk));
+            c.forget(&junk);
+        }
+        assert!(
+            !c.check_and_insert(&real),
+            "the real salt survived the flood"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_unknown_salt_is_a_no_op() {
+        let c = SaltCache::new();
+        c.forget(&[0xEEu8; 16]);
+        assert!(c.is_empty());
     }
 
     #[test]

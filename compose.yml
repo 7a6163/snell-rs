@@ -7,7 +7,7 @@ services:
       - "${PORT:-6180}:6180/tcp"
       - "${PORT:-6180}:6180/udp"
     environment:
-      PSK: ${PSK:?PSK required (min 16 chars)}
+      PSK: ${PSK:?PSK required (16-255 bytes)}
       # Unset means `default` (v6 shaped), matching official snell-server.
       # Surge clients on v5 need MODE=unshaped here.
       MODE: ${MODE:-}
