@@ -108,3 +108,59 @@ async fn quic_e2e_init_data_response() {
         "echoed payload missing in {recv:?}",
     );
 }
+
+/// A QUIC init whose ciphertext fails to open must give its salt back.
+///
+/// The replay check runs before the argon2id KDF, so the salt necessarily
+/// enters the cache unauthenticated -- and this is the path where leaving it
+/// there is cheap to abuse: a UDP source address is spoofable, so
+/// `INIT_COOLDOWN_MS` bounds nothing, and the cache is shared with the TCP
+/// handler. `replay.rs` covers the TCP arm; this is the arm that motivated the
+/// guard, and it had no coverage at any level.
+#[tokio::test]
+#[serial_test::serial]
+async fn quic_salt_from_a_failed_init_is_not_burned() {
+    let echo_port = spawn_udp_echo().await;
+    let server_port = random_tcp_port();
+
+    let _server = spawn_server(server_port, true);
+    wait_tcp(server_port).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let init = build_quic_init(PSK.as_bytes(), "127.0.0.1", echo_port);
+
+    // Same salt, corrupted ciphertext: the header AEAD open fails, so this
+    // init authenticates nothing and must not keep the salt.
+    let mut corrupt = init.clone();
+    corrupt[SALT_LEN] ^= 0xFF;
+    cli.send_to(&corrupt, ("127.0.0.1", server_port))
+        .await
+        .unwrap();
+
+    // INIT_COOLDOWN_MS is a hard-coded 1s per source IP and both packets come
+    // from 127.0.0.1, so the retry has to wait it out.
+    sleep(Duration::from_millis(1200)).await;
+
+    // The same salt again, intact this time. It has to be treated as fresh.
+    cli.send_to(&init, ("127.0.0.1", server_port))
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(300)).await;
+
+    let payload = b"salt-reuse-after-failed-init";
+    cli.send_to(&build_quic_data(payload), ("127.0.0.1", server_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 1500];
+    let (n, _src) = timeout(Duration::from_secs(3), cli.recv_from(&mut buf))
+        .await
+        .expect("no reply: the failed init kept its salt, so the retry was dropped as a replay")
+        .expect("recv error");
+    assert!(
+        buf[..n].windows(payload.len()).any(|w| w == payload),
+        "echoed payload missing in {:?}",
+        &buf[..n]
+    );
+}
