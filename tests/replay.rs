@@ -103,6 +103,97 @@ async fn tcp_handshake_replay_is_rejected() {
     }
 }
 
+/// A peer that sends only the salt has authenticated nothing, and must not be
+/// able to hold one of the server's connection slots open indefinitely on 16
+/// bytes. The v6 handlers always bounded their first request; the v5 path did
+/// not, and a few thousand silent sockets could exhaust `MAX_CONCURRENT_CONNS`.
+///
+/// Necessarily slow: it waits out the real `SALT_HANDSHAKE_TIMEOUT_SECS` budget.
+#[tokio::test]
+#[serial_test::serial]
+async fn salt_without_a_request_does_not_hold_the_connection() {
+    let target_port = spawn_tcp_target().await;
+    let server_port = random_tcp_port();
+
+    let _server = spawn_server(server_port, false);
+    wait_tcp(server_port).await;
+
+    let (handshake, _salt) = build_handshake(PSK.as_bytes(), "127.0.0.1", target_port);
+
+    let mut s = TcpStream::connect(("127.0.0.1", server_port))
+        .await
+        .unwrap();
+    // Salt only — never send the CONNECT chunk.
+    s.write_all(&handshake[..SALT_LEN]).await.unwrap();
+
+    // The server salt comes back straight away; the connection must then be
+    // closed once the first-request budget runs out.
+    let mut buf = [0u8; 64];
+    let n = timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("server salt within 2s")
+        .expect("server salt read");
+    assert_eq!(n, SALT_LEN, "server should answer with its own salt");
+
+    match timeout(Duration::from_secs(20), s.read(&mut buf)).await {
+        Ok(Ok(0)) => {}  // EOF — the server gave up on the silent peer.
+        Ok(Err(_)) => {} // Reset — also acceptable.
+        Ok(Ok(n)) => panic!("server sent {n} unexpected bytes"),
+        Err(_) => panic!("server still holding a silent connection after 20s"),
+    }
+}
+
+/// The replay cache is entered before the KDF, so it is entered unauthenticated.
+/// A salt that never opens a chunk has to give its slot back, or anyone who can
+/// reach the listener could flush the replay window with garbage — and the same
+/// cache backs the QUIC path, where a spoofed source address makes that free.
+#[tokio::test]
+#[serial_test::serial]
+async fn salt_from_a_failed_handshake_is_not_burned() {
+    let target_port = spawn_tcp_target().await;
+    let server_port = random_tcp_port();
+
+    let _server = spawn_server(server_port, false);
+    wait_tcp(server_port).await;
+
+    let (handshake, _salt) = build_handshake(PSK.as_bytes(), "127.0.0.1", target_port);
+
+    // Attempt 1: real salt, garbage chunk. The header AEAD open fails, so this
+    // salt has authenticated nothing.
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        s.write_all(&handshake[..SALT_LEN]).await.unwrap();
+        s.write_all(&[0xAAu8; 64]).await.unwrap();
+        let mut buf = [0u8; 64];
+        // Read until the server closes, so the slot is released before attempt 2.
+        loop {
+            match timeout(Duration::from_secs(2), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(_)) => continue,
+                Err(_) => panic!("server did not close on a failed handshake"),
+            }
+        }
+    }
+
+    // Attempt 2: the same salt, this time with its valid chunk. It must be
+    // treated as fresh — the server answers with its own salt rather than
+    // closing the connection as a replay.
+    let mut s = TcpStream::connect(("127.0.0.1", server_port))
+        .await
+        .unwrap();
+    s.write_all(&handshake).await.unwrap();
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_secs(2), s.read(&mut buf)).await {
+        Ok(Ok(n)) if n >= SALT_LEN => {}
+        Ok(Ok(0)) => panic!("salt was burned by a handshake that never authenticated"),
+        Ok(Ok(n)) => panic!("short read of {n} bytes"),
+        Ok(Err(e)) => panic!("connection reset after a released salt: {e}"),
+        Err(_) => panic!("server did not respond within 2s"),
+    }
+}
+
 /// HTTP-obfs dispatch path: when the first byte is 'G' the server absorbs
 /// an HTTP GET request, replies with `101 Switching Protocols`, then handles
 /// the rest as a plain Snell handshake. This covers the obfs_budget timeout

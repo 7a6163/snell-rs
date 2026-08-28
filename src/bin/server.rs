@@ -626,11 +626,16 @@ async fn handle_quic_init(
     // SAFETY: length guarded by the `< 16 + HDR_CT_LEN + 16` check above.
     let salt: [u8; 16] = packet[..16].try_into().expect("guarded above");
 
-    // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
-    if !salt_cache.check_and_insert(&salt) {
+    // CVE-3: Reject replayed salts before the costly argon2id KDF runs. This is
+    // the path where the slot has to be released on failure: a UDP source
+    // address is spoofable, so INIT_COOLDOWN_MS puts no ceiling on how fast
+    // unauthenticated salts arrive, and the cache is shared with the TCP
+    // handler — letting them accumulate would evict real sessions out of the
+    // replay window on both paths.
+    let Some(mut slot) = SaltSlot::claim(salt_cache, salt) else {
         tracing::warn!(%src, "QUIC salt replay detected, dropping");
         return;
-    }
+    };
 
     let req = match snell::quic::decrypt_init(psk, &salt, &packet[16..]) {
         Ok(r) => r,
@@ -639,6 +644,7 @@ async fn handle_quic_init(
             return;
         }
     };
+    slot.authenticated = true;
     tracing::debug!(%src, host = %req.host, port = req.port, "QUIC CONNECT_UDP");
 
     // Resolve (literal fast path + policy gate) and SSRF-check.
@@ -728,6 +734,42 @@ async fn send_quic_error(sock: &tokio::net::UdpSocket, dst: SocketAddr, psk: &[u
     pkt.extend_from_slice(&salt);
     pkt.extend_from_slice(&chunk);
     let _ = sock.send_to(&pkt, dst).await;
+}
+
+/// Holds a salt's replay-cache slot for as long as the handshake is unproven.
+///
+/// The replay check has to run before the argon2id KDF, so the salt necessarily
+/// enters the cache unauthenticated. Left there, every peer that reaches the
+/// listener — including one spoofing a UDP source address, where the per-IP
+/// cooldown cannot bound the rate — could flush the replay window with garbage
+/// and cost real sessions their protection, on both the TCP and QUIC paths that
+/// share the cache. Dropping this without [`SaltSlot::authenticated`] set
+/// releases the slot, so only salts that actually opened a chunk occupy it, and
+/// any early exit added to the handshake window later is covered by default.
+struct SaltSlot<'a> {
+    cache: &'a SaltCache,
+    salt: [u8; SALT_LEN],
+    /// Set once a chunk has opened under the key derived from this salt.
+    authenticated: bool,
+}
+
+impl<'a> SaltSlot<'a> {
+    /// Claim the slot, or `None` when the salt is a replay within the window.
+    fn claim(cache: &'a SaltCache, salt: [u8; SALT_LEN]) -> Option<Self> {
+        cache.check_and_insert(&salt).then_some(Self {
+            cache,
+            salt,
+            authenticated: false,
+        })
+    }
+}
+
+impl Drop for SaltSlot<'_> {
+    fn drop(&mut self) {
+        if !self.authenticated {
+            self.cache.forget(&self.salt);
+        }
+    }
 }
 
 /// A peer that connected and closed without sending a single byte.
@@ -969,10 +1011,11 @@ where
     .await
     .map_err(|_| anyhow::anyhow!("salt-exchange timeout"))??;
 
-    // CVE-3: Reject replayed salts before the costly argon2id KDF runs.
-    if !salt_cache.check_and_insert(&client_salt) {
+    // CVE-3: Reject replayed salts before the costly argon2id KDF runs. The slot
+    // is released again unless the peer goes on to authenticate a chunk.
+    let Some(mut slot) = SaltSlot::claim(salt_cache, client_salt) else {
         bail!("salt replay detected");
-    }
+    };
 
     let mut c2s = SnellCipher::new(psk, &client_salt)?;
 
@@ -980,7 +1023,25 @@ where
     conn.write_all(&server_salt).await?;
 
     loop {
-        let Some(payload) = read_chunk(&mut conn, &mut c2s).await? else {
+        // The first chunk is still the handshake: a peer that sends a salt and
+        // then goes quiet has authenticated nothing, and must not hold a
+        // connection slot open indefinitely on 16 bytes. Both v6 handlers
+        // already bound their first request; this is the same budget. Later
+        // iterations are the v5 connection-reuse path, where an authenticated
+        // peer idles between requests by design, so only the first is bounded.
+        let chunk = if slot.authenticated {
+            read_chunk(&mut conn, &mut c2s).await?
+        } else {
+            let chunk = tokio::time::timeout(
+                Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
+                read_chunk(&mut conn, &mut c2s),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("request timeout")))?;
+            slot.authenticated = true;
+            chunk
+        };
+        let Some(payload) = chunk else {
             break;
         };
         let req = parse_request(&payload)?;
@@ -1107,10 +1168,11 @@ async fn handle_v6_default(
     .map_err(|_| anyhow::anyhow!("v6 first-frame timeout"))??;
     let client_salt = profile.decode_first_frame(&frame)?;
 
-    // CVE-3: reject replayed salts before the costly argon2id KDF runs.
-    if !salt_cache.check_and_insert(&client_salt) {
+    // CVE-3: reject replayed salts before the costly argon2id KDF runs. The slot
+    // is released again unless the peer goes on to authenticate a record.
+    let Some(mut slot) = SaltSlot::claim(salt_cache, client_salt) else {
         bail!("salt replay detected");
-    }
+    };
     let mut c2s = SnellCipher::new(psk, &client_salt)?;
     let mut c2s_k = 0u64;
 
@@ -1123,13 +1185,14 @@ async fn handle_v6_default(
     let mut s2c_k = 0u64;
 
     // First record is the CONNECT request.
-    let Some(payload) = tokio::time::timeout(
+    let first = tokio::time::timeout(
         Duration::from_secs(SALT_HANDSHAKE_TIMEOUT_SECS),
         read_record(&mut conn, &mut c2s, &profile, &mut c2s_k),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("v6 request timeout"))??
-    else {
+    .map_err(|_| anyhow::anyhow!("v6 request timeout"))??;
+    slot.authenticated = true;
+    let Some(payload) = first else {
         return Ok(());
     };
     let req = parse_request(&payload)?;
