@@ -5,6 +5,69 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.3.0] - 2026-08-28
+
+### Security
+
+- **An unauthenticated peer could hold a connection slot open indefinitely.**
+  The v5 path timed the 16-byte salt read and then dropped into an unbounded
+  read loop, so a peer could send a salt, go silent, and squat one of the 4096
+  `MAX_CONCURRENT_CONNS` slots on 16 bytes — confirmed still open after 25 s of
+  silence. Both v6 handlers already bounded their first request; the v5 path was
+  the odd one out. It now uses the same `SALT_HANDSHAKE_TIMEOUT_SECS` budget,
+  and only for the first read: later iterations are the v5 connection-reuse
+  path, where an authenticated peer idles between requests by design.
+- **The salt replay cache could be flushed by traffic that never authenticated.**
+  The replay check has to run before the argon2id KDF, so entries were made
+  unauthenticated and never taken back out. Anyone who could reach the listener
+  could fill the 100 000-entry window with garbage and cost real sessions their
+  replay protection — cheaply over QUIC, where a UDP source address is spoofable
+  and `INIT_COOLDOWN_MS` therefore bounds nothing, and the cache is shared with
+  the TCP handler, so the damage crossed over.
+
+  The insert deliberately stays atomic and up front rather than moving after the
+  KDF, which would open a window where concurrent replays of one captured salt
+  both pass. Instead a guard releases the slot on drop unless a chunk has opened
+  under the key derived from that salt. All three handlers claim a slot; using
+  `Drop` rather than an explicit call at each exit matters, because the window
+  from insert to authentication holds three fallible steps.
+
+### Changed
+
+- `PSK` is now bounded at **16–255 bytes** on both binaries. Official
+  snell-server accepts 12–255; the floor stays higher here because the protocol
+  pins argon2id to `m=8 KiB, t=3, p=1`, which cannot stretch a short key, and
+  the error message says so outright so an operator moving a working official
+  config over can see why it was refused. The ceiling matches official and is a
+  configuration-compatibility bound only — it has no wire-level effect, since
+  the v6 shaping profile is derived from `blake2b(psk)`, not from the PSK's
+  length. **A PSK longer than 255 bytes now fails at startup instead of being
+  accepted.**
+- `snell-client` validates the PSK length at all. It previously checked nothing,
+  so an out-of-range key surfaced as an authentication failure on the first
+  connection rather than at startup.
+
+### Added
+
+- The UDP-over-TCP frame layout is now verified against official snell-server
+  v6.0.0rc2 rather than inferred. It had been implemented from `opensnell`'s
+  behaviour and never checked; disassembling rc2's frame loop (amd64 `0x43210`,
+  aarch64 `0x5255c` — both builds agree on every constant) confirms it is
+  correct. There is no length field inside a frame: the loop advances by a size
+  taken from an array supplied by its caller, so the AEAD chunk boundary is the
+  datagram boundary, which is what this implementation already did. The `frames`
+  and `first_frame` fields in rc2's error message are internal batch counters,
+  not wire structure.
+
+  Three places rc2's parser differs are documented at the call site and
+  deliberately not copied: it drops zero-payload domain datagrams, bounds-checks
+  nothing on the IP-literal path, and accepts an unknown address-type byte with
+  a zeroed sockaddr. The zero-payload divergence is pinned by a test so it is
+  not "corrected" later.
+- Regression coverage for both handshake fixes: a peer that sends only a salt
+  must be disconnected, and a salt from a handshake that never authenticated
+  must be accepted again rather than burned.
+
 ## [6.2.1] - 2026-08-14
 
 ### Fixed
