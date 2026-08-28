@@ -86,6 +86,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cipher::SALT_LEN;
 
     #[test]
     fn sizer_ramps_after_two_full_reads() {
@@ -105,10 +106,60 @@ mod tests {
     #[test]
     fn sizer_backs_off_on_partial() {
         let mut s = AdaptiveSizer::new();
-        s.on_full();
-        s.on_full(); // → 2048
+        // Ramp to 4096 before backing off. Halving 2048 lands exactly on
+        // SIZER_MIN, so starting there cannot tell "halve" apart from "return
+        // the floor" -- the step from 4096 to 2048 is what pins the halving.
+        for _ in 0..4 {
+            s.on_full();
+        }
+        assert_eq!(s.next_size(), 4096);
         s.on_partial();
-        assert_eq!(s.next_size(), 1024); // halved, floor at SIZER_MIN
+        assert_eq!(s.next_size(), 2048, "must halve, not drop to the floor");
+        s.on_partial();
+        assert_eq!(s.next_size(), 1024);
+        s.on_partial();
+        assert_eq!(s.next_size(), 1024, "floor at SIZER_MIN");
+    }
+
+    /// The sizer's unit tests drive it directly; this pins the wiring between a
+    /// read's length and the ramp decision, which nothing else covered. The
+    /// relay is only otherwise exercised end-to-end, where a wrong sizing
+    /// decision still moves every byte and so goes unnoticed -- the chunk sizes
+    /// are the whole point of the module.
+    #[tokio::test]
+    async fn relay_ramps_chunk_size_on_sustained_full_reads() {
+        const PSK: &[u8] = b"relay-test-psk-0123456789abcd";
+        let salt = [3u8; SALT_LEN];
+        let src = vec![0xABu8; 120_000];
+
+        let mut wire = Vec::new();
+        copy_t2c_adaptive(&src[..], &mut wire, SnellCipher::new(PSK, &salt).unwrap())
+            .await
+            .unwrap();
+
+        let mut rx = SnellCipher::new(PSK, &salt).unwrap();
+        let mut r = &wire[..];
+        let mut sizes = Vec::new();
+        while let Some(d) = crate::snell::read_chunk(&mut r, &mut rx).await.unwrap() {
+            sizes.push(d.len());
+        }
+
+        assert_eq!(sizes.iter().sum::<usize>(), src.len(), "every byte relayed");
+        assert_eq!(sizes[0], SIZER_MIN, "first read uses the floor");
+        // Not SIZER_MAX: the ramp tops out at 16384 but a chunk carries at most
+        // 0x3fff bytes, so `write_chunk_sized` splits each full read at the
+        // protocol ceiling and emits a 1-byte chunk after it.
+        assert_eq!(
+            *sizes.iter().max().unwrap(),
+            0x3fff,
+            "sustained full reads must ramp to the protocol chunk ceiling"
+        );
+        assert!(
+            sizes.iter().filter(|&&n| n == 1).count() > 0,
+            "SIZER_MAX exceeding the 0x3fff chunk ceiling leaves a 1-byte tail \
+             chunk per full read; if that stops happening the ceilings were \
+             reconciled and this test should be updated"
+        );
     }
 
     #[test]

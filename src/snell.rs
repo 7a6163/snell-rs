@@ -553,6 +553,40 @@ mod tests {
         }
     }
 
+    /// The `err.kind()` arm of the same table. It is reached whenever the io
+    /// error carries no errno -- a non-unix build, or an error built from a
+    /// kind rather than raised by a syscall -- and it has to agree with the
+    /// errno arm above. If it drifts, the code a peer receives depends on how
+    /// the error happened to be constructed rather than on what went wrong.
+    #[test]
+    fn connect_error_kind_fallback_agrees_with_the_errno_table() {
+        use std::io::ErrorKind as K;
+        let cases = [
+            (K::NetworkDown, errcode::NET_DOWN),
+            (K::NetworkUnreachable, errcode::NET_UNREACH),
+            (K::ConnectionReset, errcode::CONN_RESET),
+            (K::TimedOut, errcode::TIMED_OUT),
+            (K::ConnectionRefused, errcode::CONN_REFUSED),
+            (K::HostUnreachable, errcode::HOST_UNREACH),
+            // Kinds the official table deliberately leaves unnamed.
+            (K::AddrInUse, errcode::UNKNOWN),
+            (K::AddrNotAvailable, errcode::UNKNOWN),
+            (K::ConnectionAborted, errcode::UNKNOWN),
+            (K::PermissionDenied, errcode::UNKNOWN),
+        ];
+        for (kind, want) in cases {
+            let e = std::io::Error::from(kind);
+            assert_eq!(
+                e.raw_os_error(),
+                None,
+                "{kind:?} must reach the kind arm, not the errno arm"
+            );
+            let (code, msg) = connect_error(&e);
+            assert_eq!(code, want, "{kind:?}");
+            assert!(!msg.is_empty(), "{kind:?} must carry a message");
+        }
+    }
+
     #[test]
     fn pre_tunnel_error_reports_remote_eof_for_early_close() {
         for kind in [
