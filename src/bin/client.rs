@@ -85,7 +85,15 @@ async fn main() -> Result<()> {
         eprintln!("<NOTIFY> TCP Fast Open enabled (outbound)");
     }
     loop {
-        let (conn, _) = ln.accept().await?;
+        let (conn, _) = match ln.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                // EMFILE/ENFILE are transient; keep serving the tunnels already open.
+                tracing::error!(error = %e, "failed to accept new connection");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let psk = psk.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(conn, server, &psk, tfo_out, mode).await {

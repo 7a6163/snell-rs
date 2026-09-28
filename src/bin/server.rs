@@ -28,9 +28,10 @@
 //!                         it requires Linux >= 4.11 and the sysctl client bit
 //!                         (no-op on macOS).
 //!   TCP_HANDSHAKE_COOLDOWN_MS  Minimum milliseconds between fresh TCP handshakes
-//!                         from the same source IP. Default 100. Set to 0 to
-//!                         disable. Bounds the argon2id work an attacker can
-//!                         induce from a single IP.
+//!                         from the same source IP. Default 0 (off) — official
+//!                         snell-server has no per-IP limit, and v6 opens one
+//!                         connection per request. Bounds the argon2id work an
+//!                         attacker can induce from a single IP.
 //!
 //! Obfuscation auto-detected from first byte:
 //!   plain    — random Snell salt
@@ -87,10 +88,15 @@ const MAX_UDP_SESSIONS: usize = 8192;
 // C-3: Minimum milliseconds between Init packets from the same source IP.
 const INIT_COOLDOWN_MS: u128 = 1000;
 // H-7: Default TCP handshake cooldown per source IP — bounds argon2id work
-// the way INIT_COOLDOWN_MS does for QUIC. Tunable via TCP_HANDSHAKE_COOLDOWN_MS,
-// 0 to disable. Default favors connection-reuse-heavy clients (Surge) over
-// rapid reconnects from a single IP.
-const TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT: u128 = 100;
+// the way INIT_COOLDOWN_MS does for QUIC. Tunable via TCP_HANDSHAKE_COOLDOWN_MS.
+// Off by default like official rc2, which has no per-IP limit: v6 `default`
+// opens one connection per request, so any cooldown drops a page load's
+// parallel connections and throttles every user behind a shared NAT.
+const TCP_HANDSHAKE_COOLDOWN_MS_DEFAULT: u128 = 0;
+// Concurrent QUIC Init handlers (KDF + DNS + connect), spawned off the UDP
+// receive loop so a slow lookup can't stall data forwarding. Inits beyond this
+// are dropped, which bounds the work a source-spoofing flood can queue.
+const MAX_PENDING_QUIC_INITS: usize = 256;
 // Cap on cooldown-map size before GC kicks in (mirrors QUIC init_cooldown).
 const COOLDOWN_GC_THRESHOLD: usize = 10_000;
 // Idle window after which a cooldown entry is eligible for GC eviction.
@@ -100,6 +106,8 @@ type IpCooldownMap = Arc<parking_lot::Mutex<HashMap<IpAddr, std::time::Instant>>
 
 fn main() -> Result<()> {
     snell::logging::init();
+    #[cfg(unix)]
+    raise_nofile_limit();
 
     // Read systemd FDs before any threads exist.
     #[cfg(unix)]
@@ -284,6 +292,19 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     if tfo_active {
         eprintln!("<NOTIFY> TCP Fast Open enabled");
     }
+    if mode == Mode::UnsafeRaw {
+        // Official rc2 starts unsafe-raw without complaint, so this only warns;
+        // the PSK it still requires authenticates nothing in this mode.
+        tracing::warn!(
+            "MODE=unsafe-raw has no authentication or encryption: anyone who can reach \
+             {listen} can use this server as an open proxy{}",
+            if block_private {
+                ""
+            } else {
+                ", including to this host's loopback and LAN (set BLOCK_PRIVATE_TARGETS=1)"
+            }
+        );
+    }
 
     // GC idle QUIC sessions every 30 s.
     if quic_enabled {
@@ -298,7 +319,17 @@ async fn async_main_inner(activation_fds: Vec<impl Into<i32> + Copy>) -> Result<
     }
 
     loop {
-        let (conn, peer) = tcp_ln.accept().await?;
+        let (conn, peer) = match tcp_ln.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                // Official rc2 logs "Failed to accept new connection!" and keeps
+                // serving. EMFILE/ENFILE clear once a tunnel closes; the pause
+                // keeps the loop from spinning while the table is still full.
+                tracing::error!(error = %e, "failed to accept new connection");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
 
         // H-7: Per-source-IP TCP handshake cooldown — checked before the
         // semaphore acquire so a rate-limited IP doesn't briefly consume a slot.
@@ -365,6 +396,45 @@ fn make_tls_acceptor() -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Raise the soft `RLIMIT_NOFILE` the way official rc2 does at startup (the
+/// getrlimit/setrlimit pair next to "Current file descriptor limit"): to
+/// `min(hard - 1, 102400)`, never lowering it. Each tunnel costs two fds, so the
+/// common 1024 default runs out a few hundred connections in.
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let want = lim.rlim_max.saturating_sub(1).min(0x19000);
+    if want <= lim.rlim_cur {
+        return;
+    }
+    lim.rlim_cur = want;
+    // SAFETY: `lim` is a valid rlimit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to increase file descriptor limit"
+        );
+    } else {
+        tracing::debug!(limit = want, "increased file descriptor limit");
+    }
+}
+
+/// Whether `ip` is outside its cooldown window, without recording anything.
+/// The QUIC path checks this before decrypting and records only once the Init
+/// authenticates, so a spoofed junk Init can't lock the real owner of an IP out.
+fn cooldown_ready(map: &IpCooldownMap, ip: IpAddr, cooldown_ms: u128) -> bool {
+    map.lock()
+        .get(&ip)
+        .is_none_or(|last| last.elapsed().as_millis() >= cooldown_ms)
+}
+
 /// Atomic per-source-IP cooldown check. Returns `true` if the IP is allowed
 /// through (and records the current timestamp); `false` if the previous entry
 /// is younger than `cooldown_ms`. Used by both the TCP accept loop and the
@@ -387,6 +457,14 @@ fn cooldown_check_and_insert(
             .checked_sub(Duration::from_secs(COOLDOWN_GC_IDLE_SECS))
             .unwrap_or(now);
         cool.retain(|_, t| *t >= cutoff);
+        // More than half still live means a flood of distinct sources. Forget
+        // them rather than keep growing: memory stays bounded and the next GC
+        // is at least THRESHOLD/2 inserts away, so the O(n) retain amortizes
+        // to O(1) instead of running on every insert.
+        // ponytail: fails open for the flood's IPs; a real LRU if that matters.
+        if cool.len() > COOLDOWN_GC_THRESHOLD / 2 {
+            cool.clear();
+        }
     }
     true
 }
@@ -450,7 +528,8 @@ fn spawn_udp_listener(
 fn is_safe_v4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
     // Block: loopback, private, link-local, broadcast, this-host (0.0.0.0/8),
-    // CGNAT (100.64.0.0/10), IETF Protocol Assignments (192.0.0.0/24), unspecified.
+    // CGNAT (100.64.0.0/10), IETF Protocol Assignments (192.0.0.0/24), unspecified,
+    // benchmarking (198.18.0.0/15), reserved (240.0.0.0/4).
     !v4.is_loopback()
         && !v4.is_private()
         && !v4.is_link_local()
@@ -459,6 +538,8 @@ fn is_safe_v4(v4: Ipv4Addr) -> bool {
         && (octets[0] != 0) // 0.0.0.0/8 this-host (RFC 1122)
         && !(octets[0] == 100 && (octets[1] & 0xC0) == 64) // 100.64.0.0/10 CGNAT (RFC 6598)
         && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 IETF Protocol Assignments (RFC 6890)
+        && !(octets[0] == 198 && (octets[1] & 0xFE) == 18) // 198.18.0.0/15 benchmarking (RFC 2544)
+        && octets[0] < 240 // 240.0.0.0/4 reserved (RFC 1112)
 }
 
 /// Returns false for addresses that should never be proxy targets (SSRF guard).
@@ -476,14 +557,26 @@ fn is_safe_target(addr: &SocketAddr, block_private: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => is_safe_v4(v4),
         IpAddr::V6(v6) => {
-            // C-1: Unwrap IPv4-mapped addresses (::ffff:a.b.c.d) and apply IPv4 rules.
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+            // C-1: Forms that carry an IPv4 destination get the IPv4 rules:
+            // mapped ::ffff:a.b.c.d and compatible ::a.b.c.d, NAT64
+            // 64:ff9b::/96 (RFC 6052), and 6to4 2002::/16 (RFC 3056).
+            if let Some(v4) = v6.to_ipv4() {
                 return is_safe_v4(v4);
+            }
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return is_safe_v4(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_safe_v4(embedded(s[1], s[2]));
             }
             !v6.is_loopback()
                 && !v6.is_unspecified()
-                && (v6.segments()[0] & 0xfe00) != 0xfc00 // unique local fc00::/7
-                && (v6.segments()[0] & 0xffc0) != 0xfe80 // link-local fe80::/10
+                && (s[0] & 0xfe00) != 0xfc00 // unique local fc00::/7
+                && (s[0] & 0xffc0) != 0xfe80 // link-local fe80::/10
+                && (s[0] & 0xffc0) != 0xfec0 // deprecated site-local fec0::/10
+                && s[..3] != [0x64, 0xff9b, 1] // local-use NAT64 64:ff9b:1::/48 (RFC 8215)
         }
     }
 }
@@ -545,6 +638,7 @@ async fn run_udp_relay(
     init_cooldown: IpCooldownMap,
     salt_cache: SaltCache,
 ) -> Result<()> {
+    let init_sem = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_QUIC_INITS));
     let mut buf = vec![0u8; 65535];
     loop {
         let (n, src) = match sock.recv_from(&mut buf).await {
@@ -572,19 +666,34 @@ async fn run_udp_relay(
                 let _ = session.target_sock.send(&buf[..n]).await;
             }
             (snell::quic::PacketKind::Init, _) => {
-                handle_quic_init(
-                    &buf[..n],
-                    src,
-                    &sock,
-                    &table,
-                    &psk,
-                    iface.as_deref().map(String::as_str),
-                    block_private,
-                    &resolver,
-                    &init_cooldown,
-                    &salt_cache,
-                )
-                .await;
+                let Ok(permit) = init_sem.clone().try_acquire_owned() else {
+                    tracing::warn!(%src, "QUIC init backlog full, dropping");
+                    continue;
+                };
+                let packet = buf[..n].to_vec();
+                let sock = sock.clone();
+                let table = table.clone();
+                let psk = psk.clone();
+                let iface = iface.clone();
+                let resolver = resolver.clone();
+                let init_cooldown = init_cooldown.clone();
+                let salt_cache = salt_cache.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_quic_init(
+                        &packet,
+                        src,
+                        &sock,
+                        &table,
+                        &psk,
+                        iface.as_deref().map(String::as_str),
+                        block_private,
+                        &resolver,
+                        &init_cooldown,
+                        &salt_cache,
+                    )
+                    .await;
+                });
             }
         }
     }
@@ -610,8 +719,9 @@ async fn handle_quic_init(
         return;
     }
 
-    // C-3: Per-IP rate limit to throttle argon2id work.
-    if !cooldown_check_and_insert(init_cooldown, src.ip(), INIT_COOLDOWN_MS) {
+    // C-3: Per-IP rate limit to throttle argon2id work. Only checked here; the
+    // source IP is spoofable, so it is recorded once the Init authenticates.
+    if !cooldown_ready(init_cooldown, src.ip(), INIT_COOLDOWN_MS) {
         tracing::warn!(%src, "QUIC init rate-limited");
         return;
     }
@@ -644,6 +754,10 @@ async fn handle_quic_init(
         }
     };
     slot.authenticated = true;
+    if !cooldown_check_and_insert(init_cooldown, src.ip(), INIT_COOLDOWN_MS) {
+        tracing::warn!(%src, "QUIC init rate-limited");
+        return;
+    }
     tracing::debug!(%src, host = %req.host, port = req.port, "QUIC CONNECT_UDP");
 
     // Resolve (literal fast path + policy gate) and SSRF-check.
@@ -692,16 +806,21 @@ async fn handle_quic_init(
         client_addr: src,
         target_sock: target_sock.clone(),
         last_seen: AtomicU64::new(0),
+        relay: std::sync::OnceLock::new(),
     });
     session.touch();
-    // H-6: Init path uses write lock.
-    table.write().await.insert(src, session.clone());
 
     // Spawn target -> client forwarding task.
-    // H-1: Remove the session from the table when the relay exits.
+    // H-1: Remove the session from the table when the relay exits — but only if
+    // it is still this one; a newer Init from the same address replaces it.
+    // Spawned under the write lock (H-6: Init path uses write lock) so the
+    // relay's cleanup can't run before the insert and strand a dead session.
     let sock_back = sock.clone();
     let table_cleanup = table.clone();
-    tokio::spawn(async move {
+    let relay_session = session.clone();
+    let mut t = table.write().await;
+    let relay = tokio::spawn(async move {
+        let session = relay_session;
         let mut rbuf = vec![0u8; 65535];
         while let Ok(m) = target_sock.recv(&mut rbuf).await {
             if m == 0 {
@@ -712,8 +831,15 @@ async fn handle_quic_init(
             }
             session.touch();
         }
-        table_cleanup.write().await.remove(&src);
+        let mut t = table_cleanup.write().await;
+        if t.get(&src).is_some_and(|s| Arc::ptr_eq(s, &session)) {
+            t.remove(&src);
+        }
     });
+    let _ = session.relay.set(relay.abort_handle());
+    if let Some(old) = t.insert(src, session) {
+        old.stop();
+    }
 }
 
 /// Answer a rejected QUIC `CONNECT_UDP` with an error frame instead of dropping
@@ -1760,6 +1886,50 @@ mod tests {
     fn accepts_ipv4_mapped_public() {
         // C-1: ::ffff:8.8.8.8 must unwrap to a public IPv4 and pass.
         assert!(is_safe_target(&v6("::ffff:8.8.8.8"), true));
+    }
+
+    #[test]
+    fn rejects_ipv6_forms_embedding_private_ipv4() {
+        assert!(!is_safe_target(&v6("::10.0.0.1"), true)); // IPv4-compatible
+        assert!(!is_safe_target(&v6("64:ff9b::a00:1"), true)); // NAT64 → 10.0.0.1
+        assert!(!is_safe_target(&v6("64:ff9b::7f00:1"), true)); // NAT64 → 127.0.0.1
+        assert!(!is_safe_target(&v6("2002:c0a8:101::1"), true)); // 6to4 → 192.168.1.1
+        assert!(!is_safe_target(&v6("64:ff9b:1::808:808"), true)); // local-use NAT64
+        assert!(!is_safe_target(&v6("fec0::1"), true)); // site-local
+    }
+
+    #[test]
+    fn accepts_ipv6_forms_embedding_public_ipv4() {
+        assert!(is_safe_target(&v6("64:ff9b::808:808"), true));
+        assert!(is_safe_target(&v6("2002:808:808::1"), true));
+    }
+
+    #[test]
+    fn rejects_benchmarking_and_reserved_ipv4() {
+        assert!(!is_safe_target(&v4(198, 18, 0, 1), true));
+        assert!(!is_safe_target(&v4(198, 19, 255, 255), true));
+        assert!(is_safe_target(&v4(198, 20, 0, 1), true));
+        assert!(!is_safe_target(&v4(240, 0, 0, 1), true));
+        assert!(is_safe_target(&v4(223, 255, 255, 255), true));
+    }
+
+    #[test]
+    fn cooldown_map_stays_bounded_under_a_flood() {
+        let map: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        for i in 0..(COOLDOWN_GC_THRESHOLD as u32 * 3) {
+            cooldown_check_and_insert(&map, IpAddr::V4(Ipv4Addr::from(i)), 1000);
+        }
+        assert!(map.lock().len() <= COOLDOWN_GC_THRESHOLD);
+    }
+
+    #[test]
+    fn cooldown_ready_does_not_record() {
+        let map: IpCooldownMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(cooldown_ready(&map, ip, 1000));
+        assert!(cooldown_ready(&map, ip, 1000));
+        assert!(cooldown_check_and_insert(&map, ip, 1000));
+        assert!(!cooldown_ready(&map, ip, 1000));
     }
 
     #[test]

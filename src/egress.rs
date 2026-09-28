@@ -55,7 +55,6 @@ pub fn bind_udp(local: SocketAddr, iface: Option<&str>) -> Result<UdpSocket> {
     };
     let sock =
         Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create UDP socket")?;
-    sock.set_reuse_address(true).context("SO_REUSEADDR")?;
     sock.bind(&local.into()).context("bind UDP")?;
 
     if let Some(iface) = iface {

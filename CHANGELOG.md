@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`TCP_HANDSHAKE_COOLDOWN_MS` now defaults to `0` (off)**, matching official
+  snell-server, which has no per-IP limit. The old 100 ms default dropped most of
+  a page load's parallel connections under `MODE=default` (one request per
+  connection) and made clients behind a shared NAT throttle each other.
+- The server raises its soft `RLIMIT_NOFILE` at startup to
+  `min(hard - 1, 102400)`, as official rc2 does.
+- `MODE=unsafe-raw` logs a startup warning that the port is an unauthenticated
+  open proxy (and reaches loopback/LAN unless `BLOCK_PRIVATE_TARGETS=1`).
+
+### Fixed
+
+- **A failed `accept()` killed the server.** Running out of file descriptors
+  returned out of the accept loop and dropped every open tunnel. It is now
+  logged and retried, like official rc2's "Failed to accept new connection!";
+  `snell-client` gets the same fix.
+- **A spoofed QUIC Init could lock an IP out.** The per-IP Init cooldown was
+  recorded before decryption, so junk Inits carrying a victim's source address
+  kept the victim from ever opening a session. It is now recorded only after the
+  Init authenticates.
+- **The per-IP cooldown maps grew without bound** and, past 10,000 entries, ran
+  an O(n) sweep under a global lock on every insert. The map is now cleared when
+  a sweep leaves it more than half full.
+- **QUIC Init handling ran inline in the UDP receive loop**, so one slow DNS
+  lookup stalled forwarding for every QUIC session. Inits now run in their own
+  tasks, at most 256 at a time.
+- **Idle QUIC sessions leaked** their outbound socket and relay task: GC removed
+  the table entry but left the task blocked in `recv()`. GC and a replacing Init
+  now stop the task, and a finished relay no longer removes the newer session
+  that replaced it.
+- The QUIC listening socket no longer sets `SO_REUSEADDR`, which on Linux let
+  another local user bind the same UDP port and take incoming datagrams.
+- `BLOCK_PRIVATE_TARGETS=1` missed several routes into private space: IPv4-
+  compatible `::a.b.c.d`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4
+  `2002::/16`, site-local `fec0::/10`, `198.18.0.0/15` and `240.0.0.0/4`.
+
 ## [6.3.1] - 2026-08-28
 
 ### Fixed

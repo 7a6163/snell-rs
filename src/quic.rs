@@ -17,8 +17,8 @@
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -94,9 +94,19 @@ pub struct UdpSession {
     pub client_addr: SocketAddr,
     pub target_sock: Arc<UdpSocket>,
     pub last_seen: AtomicU64,
+    /// The target -> client relay task. Removing a session from the table does
+    /// not end that task (it sits in `target_sock.recv()`), so whoever evicts a
+    /// session must call [`UdpSession::stop`] or the socket and task leak.
+    pub relay: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl UdpSession {
+    pub fn stop(&self) {
+        if let Some(h) = self.relay.get() {
+            h.abort();
+        }
+    }
+
     pub fn touch(&self) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -120,10 +130,13 @@ pub async fn gc_sessions(table: &SessionTable, timeout_secs: u64) {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let cutoff = now_nanos.saturating_sub(timeout_secs.saturating_mul(1_000_000_000));
-    table
-        .write()
-        .await
-        .retain(|_, s| s.last_seen.load(Ordering::Relaxed) >= cutoff);
+    table.write().await.retain(|_, s| {
+        let live = s.last_seen.load(Ordering::Relaxed) >= cutoff;
+        if !live {
+            s.stop();
+        }
+        live
+    });
 }
 
 /// Decrypt the init datagram payload after stripping the 16-byte salt.
@@ -187,6 +200,29 @@ mod tests {
         let mut p = vec![0u8; 20];
         p[0] = 0xA0;
         assert_eq!(classify(&p), Some(PacketKind::Init));
+    }
+
+    #[tokio::test]
+    async fn gc_stops_the_evicted_relay_task() {
+        let target_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let session = Arc::new(UdpSession {
+            client_addr: "127.0.0.1:1".parse().unwrap(),
+            target_sock: target_sock.clone(),
+            last_seen: AtomicU64::new(0),
+            relay: OnceLock::new(),
+        });
+        let relay = tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            let _ = target_sock.recv(&mut buf).await;
+        });
+        session.relay.set(relay.abort_handle()).unwrap();
+        let table = new_session_table();
+        table.write().await.insert(session.client_addr, session);
+
+        gc_sessions(&table, 60).await;
+
+        assert!(table.read().await.is_empty());
+        assert!(relay.await.unwrap_err().is_cancelled());
     }
 
     #[test]

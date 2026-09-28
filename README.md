@@ -72,7 +72,7 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | `QUIC` | — | `0` | Set to `1` to enable QUIC proxy mode |
 | `TCP_FASTOPEN` | — | `1` | Server-side TFO. Set to `0` to disable. See [TCP Fast Open](#tcp-fast-open) |
 | `TCP_FASTOPEN_OUT` | — | `0` | Set to `1` to opt outbound CONNECT sockets into client-side TFO |
-| `TCP_HANDSHAKE_COOLDOWN_MS` | — | `100` | Per-source-IP minimum ms between fresh TCP handshakes. Bounds argon2id DoS from a single IP. `0` disables |
+| `TCP_HANDSHAKE_COOLDOWN_MS` | — | `0` | Per-source-IP minimum ms between fresh TCP handshakes; bounds argon2id DoS from a single IP. Off by default like official snell-server — v6 `default` opens one connection per request, so a cooldown drops parallel connections and throttles clients sharing a NAT |
 | `RUST_LOG` | — | `info` | [tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive. Examples: `debug`, `snell::quic=debug,info`, `error` |
 | `LOG_FORMAT` | — | text | Set to `json` for line-delimited JSON output (for Loki / ELK ingest) |
 
@@ -152,7 +152,7 @@ The three modes trade off detection-resistance against complexity:
 |---|---|---|---|---|
 | `default` | scattered in a PSK-sized first frame (permuted + XOR keystream) | argon2id + AES-128-GCM | per-chunk PSK-derived prefix (doubles as header AEAD AAD) | Surge default; DPI-resistant traffic shaping. **The default when `MODE` is unset**, matching official snell-server |
 | `unshaped` | raw 16 bytes | argon2id + AES-128-GCM | v5 chunks, empty header AAD | byte-identical to the v5 wire; **required to serve a v5 client** |
-| `unsafe-raw` | none | none (plaintext) | 5-byte plaintext header + plaintext payload | only behind an already-secure outer channel |
+| `unsafe-raw` | none | none (plaintext) | 5-byte plaintext header + plaintext payload | only behind an already-secure outer channel — anyone who reaches the port has an open proxy (the server logs a warning at startup) |
 
 The crypto (argon2id KDF, AES-128-GCM, 12-byte LE counter nonce) is identical
 across all three modes and unchanged from v5. The `default` shaping profile is
