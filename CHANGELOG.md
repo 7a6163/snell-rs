@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.4.1] - 2026-09-28
+
+### Security
+
+- Bumped `rustls` to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption-level boundaries). Unlike the `lru`
+  advisory in 6.0.0 this one is reachable: the `obfs=tls` path in `unshaped`
+  mode runs a rustls server handshake on every connection that opens with
+  `0x16`. `rustls-webpki`, `aws-lc-rs` and `aws-lc-sys` moved with it.
+
 ## [6.4.0] - 2026-09-28
 
 ### Changed
